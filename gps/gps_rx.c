@@ -1,16 +1,29 @@
 /*
- * gps_rx.c - standalone GPS L1 C/A software receiver (no GNSS-SDR needed)
+ * gps_rx.c - standalone GPS L1 C/A software receiver
  *
- * Input : complex float32 IQ file (GRC File Sink, "Complex"), recorded at
- *         exactly 4.096 MS/s, centered on 1575.42 MHz.
- * Does  : FFT acquisition -> FLL/PLL/DLL tracking -> bit sync -> subframe
- *         parity + ephemeris decode -> pseudoranges -> least-squares fix.
- * Build : gcc -O3 -march=native -o gps_rx gps_rx.c -lm
- * Run   : ./gps_rx gps_captured.iq
+ * Supports two modes:
+ *   File:    ./gps_rx capture.iq          (batch, same as before)
+ *   Stream:  ./gps_rx                     (reads complex float32 IQ from stdin)
+ *            ./gps_rx -                   (explicit stdin)
  *
- * Record >= 90 s (ephemeris needs subframes 1,2,3 back to back, which can
- * take up to ~50 s from an arbitrary start). No iono/tropo correction, so
- * expect tens of meters of error.
+ * Streaming lets you pipe live IQ from GNURadio for real-time GPS fixes:
+ *
+ *   Linux (named pipe):
+ *     mkfifo /tmp/gps_iq
+ *     # set GNURadio File Sink path to /tmp/gps_iq
+ *     ./gps_rx < /tmp/gps_iq
+ *
+ *   Linux (direct pipe from GRC-generated Python):
+ *     python3 gps_recv.py --output -  |  ./gps_rx
+ *
+ *   Any OS (TCP):
+ *     # In GNURadio: add a TCP Sink on port 5555
+ *     ncat localhost 5555 | ./gps_rx
+ *
+ * Input format: complex float32 (interleaved I/Q, 8 bytes per sample),
+ *               4.096 MS/s, centered on 1575.42 MHz.
+ *
+ * Build: gcc -O3 -march=native -o gps_rx gps_rx.c -lm
  */
 #define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
@@ -19,17 +32,22 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
 
 #ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#include <windows.h>
 #define FSEEK _fseeki64
 #define FTELL _ftelli64
 #else
+#include <unistd.h>
 #define FSEEK fseeko
 #define FTELL ftello
 #endif
 
 /* ------------------------- configuration ------------------------- */
-#define FS            4096000.0     /* sample rate; 4096 samples per 1 ms */
+#define FS            4096000.0
 #define NS            4096
 #define F_L1          1575.42e6
 #define CODE_RATE     1.023e6
@@ -38,19 +56,21 @@
 #define MU            3.986005e14
 #define PI            3.14159265358979323846
 
-#define ACQ_MS        10            /* non-coherent integration length    */
-#define ACQ_DOPP_MAX  20000         /* Hz, includes HackRF clock offset   */
+#define ACQ_MS        20
+#define ACQ_DOPP_MAX  20000
 #define ACQ_DOPP_STEP 250
-#define ACQ_THRESH    2.0           /* peak / second-peak                 */
-#define ACQ_START_S   0.5           /* skip start-up transient            */
+#define ACQ_THRESH    1.8
+#define ACQ_START_S   0.5
 #define MAX_CH        12
 
-#define FLL_MS        400           /* frequency pull-in before the PLL   */
-#define PLL_BN        20.0          /* Hz                                 */
+#define FLL_MS        400
+#define PLL_BN        20.0
 #define ZETA          0.7071
-#define DLL_GAIN      0.01          /* chips of correction per unit error */
+#define DLL_GAIN      0.01
 
-#define TRACK_MS_MAX 60000   /* 60 s of data? */
+#define TRACK_MS_MAX  300000       /* 5 minutes; for streaming, effectively unlimited */
+
+#define STREAM_INIT_CAP (1 << 22) /* ~4M samples initial buffer */
 
 /* ------------------------- basic types --------------------------- */
 typedef struct { double r, i; } cpx;
@@ -58,32 +78,144 @@ typedef struct { float i, q; } sample_t;
 
 static inline cpx cmul(cpx a, cpx b){ cpx c={a.r*b.r-a.i*b.i, a.r*b.i+a.i*b.r}; return c; }
 
-/* ------------------------- file streaming ------------------------ */
-#define CHUNK (1<<22)
-typedef struct { FILE *f; sample_t *buf; long long base, len, total; } stream_t;
+/* ------------------------- stream -------------------------------- */
+#define STREAM_MODE_FILE   0   /* batch: read completed file                */
+#define STREAM_MODE_STDIN  1   /* pipe: read stdin                         */
+#define STREAM_MODE_TAIL   2   /* tail: read growing file, poll for growth */
 
-static int stream_open(stream_t *s, const char *path)
+typedef struct {
+    FILE *f;
+    sample_t *buf;
+    long long base;      /* absolute sample index of buf[0] */
+    long long len;       /* valid samples currently in buf   */
+    long long capacity;  /* allocated buf size in samples    */
+    long long total;     /* file mode: total samples in file; stream: -1 */
+    int mode;
+    int eof;
+} stream_t;
+
+static int stream_open_file(stream_t *s, const char *path)
 {
+    memset(s, 0, sizeof(*s));
     s->f = fopen(path, "rb");
     if (!s->f) return 0;
     FSEEK(s->f, 0, SEEK_END);
     s->total = (long long)FTELL(s->f) / (long long)sizeof(sample_t);
-    s->buf = (sample_t *)malloc((size_t)CHUNK * sizeof(sample_t));
-    s->base = 0; s->len = 0;
+    s->capacity = STREAM_INIT_CAP;
+    s->buf = (sample_t *)malloc((size_t)s->capacity * sizeof(sample_t));
+    s->mode = STREAM_MODE_FILE;
     return s->buf != NULL;
 }
 
-/* pointer to sample n with at least `need` contiguous samples, or NULL */
+static int stream_open_stdin(stream_t *s)
+{
+    memset(s, 0, sizeof(*s));
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+    s->f = stdin;
+    s->mode = STREAM_MODE_STDIN;
+    s->total = -1;
+    s->capacity = STREAM_INIT_CAP;
+    s->buf = (sample_t *)malloc((size_t)s->capacity * sizeof(sample_t));
+    return s->buf != NULL;
+}
+
+static int stream_open_tail(stream_t *s, const char *path)
+{
+    memset(s, 0, sizeof(*s));
+    s->f = fopen(path, "rb");
+    if (!s->f) return 0;
+    s->mode = STREAM_MODE_TAIL;
+    s->total = -1;
+    s->capacity = STREAM_INIT_CAP;
+    s->buf = (sample_t *)malloc((size_t)s->capacity * sizeof(sample_t));
+    return s->buf != NULL;
+}
+
+static void stream_sleep_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
+}
+
+/* try to read more samples; for tail mode, retries with sleep */
+static int stream_read_more(stream_t *s, long long need_total)
+{
+    int max_retries = (s->mode == STREAM_MODE_TAIL) ? 200 : 0; /* 200 * 50ms = 10s */
+    int attempt = 0;
+
+    while (s->base + s->len < need_total) {
+        if (s->len >= s->capacity) {
+            s->capacity *= 2;
+            s->buf = (sample_t *)realloc(s->buf,
+                        (size_t)s->capacity * sizeof(sample_t));
+        }
+        long long space = s->capacity - s->len;
+        size_t got = fread(s->buf + s->len, sizeof(sample_t),
+                           (size_t)space, s->f);
+        if (got > 0) {
+            s->len += (long long)got;
+            attempt = 0;
+        } else if (s->mode == STREAM_MODE_TAIL && attempt < max_retries) {
+            clearerr(s->f);
+            stream_sleep_ms(50);
+            attempt++;
+        } else {
+            if (s->mode != STREAM_MODE_TAIL) s->eof = 1;
+            break;
+        }
+    }
+    return s->base + s->len >= need_total;
+}
+
 static const sample_t *stream_get(stream_t *s, long long n, long long need)
 {
-    if (n < 0 || n + need > s->total) return NULL;
-    if (n < s->base || n + need > s->base + s->len) {
-        FSEEK(s->f, (long long)n * (long long)sizeof(sample_t), SEEK_SET);
-        s->len = (long long)fread(s->buf, sizeof(sample_t), CHUNK, s->f);
-        s->base = n;
-        if (s->len < need) return NULL;
+    if (n < s->base) return NULL;
+
+    if (s->mode == STREAM_MODE_STDIN || s->mode == STREAM_MODE_TAIL) {
+        if (!stream_read_more(s, n + need)) return NULL;
+        return s->buf + (n - s->base);
+    } else {
+        /* file mode: chunk-based random access (original behavior) */
+        if (n < 0 || n + need > s->total) return NULL;
+        if (n < s->base || n + need > s->base + s->len) {
+            FSEEK(s->f, (long long)n * (long long)sizeof(sample_t), SEEK_SET);
+            long long want = s->capacity;
+            if (want > s->total - n) want = s->total - n;
+            s->len = (long long)fread(s->buf, sizeof(sample_t),
+                                       (size_t)want, s->f);
+            s->base = n;
+            if (s->len < need) return NULL;
+        }
+        return s->buf + (n - s->base);
     }
-    return s->buf + (n - s->base);
+}
+
+/* discard samples before min_needed to free memory (streaming only) */
+static void stream_trim(stream_t *s, long long min_needed)
+{
+    if (s->mode == STREAM_MODE_FILE) return;
+    if (min_needed <= s->base) return;
+    long long discard = min_needed - s->base;
+    if (discard >= s->len) {
+        s->base += s->len;
+        s->len = 0;
+    } else {
+        memmove(s->buf, s->buf + discard,
+                (size_t)(s->len - discard) * sizeof(sample_t));
+        s->base += discard;
+        s->len -= discard;
+    }
+}
+
+/* ensure at least `need` total samples are available (blocking read) */
+static int stream_fill(stream_t *s, long long need)
+{
+    return stream_get(s, need - 1, 1) != NULL;
 }
 
 /* ------------------------- C/A code ------------------------------ */
@@ -92,7 +224,7 @@ static const int g2tap[33][2] = {
     {5,6},{6,7},{7,8},{8,9},{9,10},{1,4},{2,5},{3,6},{4,7},{5,8},{6,9},{1,3},
     {4,6},{5,7},{6,8},{7,9},{8,10},{1,6},{2,7},{3,8},{4,9}};
 
-static void gen_ca(int prn, int8_t *out)   /* out[1023] = +1 / -1 */
+static void gen_ca(int prn, int8_t *out)
 {
     int g1[10], g2[10], k;
     for (k = 0; k < 10; k++) g1[k] = g2[k] = 1;
@@ -164,7 +296,7 @@ static int acquire(stream_t *s, long long start, acq_t *out)
 
     for (int k = 0; k < ACQ_MS; k++) {
         const sample_t *p = stream_get(s, start + (long long)k * NS, NS);
-        if (!p) { fprintf(stderr, "file too short for acquisition\n"); return 0; }
+        if (!p) { fprintf(stderr, "not enough data for acquisition\n"); return 0; }
         for (int n = 0; n < NS; n++) { blk[k*NS+n].r = p[n].i; blk[k*NS+n].i = p[n].q; }
     }
     for (int prn = 1; prn <= 32; prn++) {
@@ -205,19 +337,11 @@ static int acquire(stream_t *s, long long start, acq_t *out)
         }
     }
 
-   
     fprintf(stderr, "\n--- Acquisition results ---\n");
-
-for (int prn = 1; prn <= 32; prn++) {
-    fprintf(stderr,
-            "PRN %2d: peak=%12.3e  ratio=%6.2f  dop=%7.0f Hz  cp=%4d\n",
-            prn,
-            bpeak[prn],
-            bratio[prn],
-            bdop[prn],
-            bcp[prn]);
-}
-
+    for (int prn = 1; prn <= 32; prn++) {
+        fprintf(stderr, "PRN %2d: peak=%12.3e  ratio=%6.2f  dop=%7.0f Hz  cp=%4d\n",
+                prn, bpeak[prn], bratio[prn], bdop[prn], bcp[prn]);
+    }
     fprintf(stderr, "--- End acquisition results ---\n");
 
     for (int prn = 1; prn <= 32; prn++) {
@@ -245,86 +369,142 @@ typedef struct {
     double cic, omg0, cis, i0, crc, omg, omgd, idot;
 } eph_t;
 
+/* ------------------------- channel ------------------------------- */
 typedef struct {
-    int prn, nep;
-    double *ip, *qp, *epos;       /* per code-epoch prompt I/Q, start sample */
+    int prn;
     int8_t code[1023];
-    int have_t0, e0; double t0;   /* epoch e0 starts at GPS time-of-week t0 */
+
+    /* correlation history (grows during tracking) */
+    double *ip, *qp, *epos;
+    int nep, maxep;
+
+    /* tracking NCO state */
+    long long n;
+    double p;            /* code phase within current epoch */
+    double phase;        /* carrier phase */
+    double fcar;         /* carrier frequency estimate */
+    double wint;         /* PLL integrator */
+    double ipv, qpv;     /* previous epoch prompt I/Q (for FLL) */
+    int have_prev;
+
+    /* status */
+    int active;
+    int locked;
+
+    /* navigation */
+    int have_t0, e0;
+    double t0;
     eph_t eph;
     int nsf;
 } chan_t;
 
 /* ------------------------- tracking ------------------------------ */
-static int track(stream_t *s, long long n0, double dop0, chan_t *c)
+static void track_init(chan_t *c, long long n0, double dop0)
 {
-    int maxep = (int)((s->total - n0) / 4090) + 4;
-    if (maxep > TRACK_MS_MAX) maxep = TRACK_MS_MAX; // limit tracking to 120 s of data
-    c->ip = (double *)malloc(sizeof(double) * maxep);
-    c->qp = (double *)malloc(sizeof(double) * maxep);
-    c->epos = (double *)malloc(sizeof(double) * maxep);
+    c->maxep = 8192;
+    c->ip   = (double *)malloc(sizeof(double) * c->maxep);
+    c->qp   = (double *)malloc(sizeof(double) * c->maxep);
+    c->epos = (double *)malloc(sizeof(double) * c->maxep);
     gen_ca(c->prn, c->code);
+    c->n = n0;
+    c->p = 0.0;
+    c->phase = 0.0;
+    c->fcar = dop0;
+    c->wint = 0.0;
+    c->ipv = c->qpv = 0.0;
+    c->have_prev = 0;
+    c->nep = 0;
+    c->active = 1;
+    c->locked = 0;
+    memset(&c->eph, 0, sizeof(eph_t));
+    c->have_t0 = 0;
+    c->nsf = 0;
+}
 
-    long long n = n0;
-    double p = 0.0, phase = 0.0, fcar = dop0, wint = 0.0;
-    double ipv = 0, qpv = 0; int have_prev = 0;
-    double wn = PLL_BN / 0.53;
-    int i = 0;
+/* process one code epoch (~1 ms); returns 1=ok, 0=no data, -1=lock fail */
+static int track_epoch(stream_t *s, chan_t *c)
+{
+    if (!c->active) return 0;
+    int i = c->nep;
 
-    while (i < maxep) {
-        double step = CODE_RATE * (1.0 + fcar / F_L1) / FS;
-        double dphi = 2.0 * PI * fcar / FS;
-        const sample_t *x = stream_get(s, n, NS + 16);
-        if (!x) break;
-        c->epos[i] = (double)n - p / step;
-
-        double er = cos(phase), ei = -sin(phase);
-        double rr = cos(dphi),  ri = -sin(dphi);
-        double Pi = 0, Pq = 0, Ei = 0, Eq = 0, Li = 0, Lq = 0;
-        int k = 0;
-        while (p < 1023.0 && k < NS + 8) {
-            double xr = x[k].i, xi = x[k].q;
-            double sr = xr * er - xi * ei, si = xr * ei + xi * er;
-            double pe = p + 0.5, pl = p - 0.5;
-            double cp = c->code[cidx(p)], ce = c->code[cidx(pe)], cl = c->code[cidx(pl)];
-            Pi += sr * cp; Pq += si * cp;
-            Ei += sr * ce; Eq += si * ce;
-            Li += sr * cl; Lq += si * cl;
-            double t = er * rr - ei * ri; ei = er * ri + ei * rr; er = t;
-            p += step; k++;
-        }
-        n += k; p -= 1023.0;
-        phase = fmod(phase + dphi * k, 2.0 * PI);
-        c->ip[i] = Pi; c->qp[i] = Pq;
-
-        /* code loop (non-coherent early-late, carrier aided) */
-        double Em = hypot(Ei, Eq), Lm = hypot(Li, Lq);
-        if (Em + Lm > 0) p += DLL_GAIN * 0.5 * (Em - Lm) / (Em + Lm);
-
-        /* carrier loop: FLL pull-in, then Costas PLL */
-        if (i < FLL_MS) {
-            if (have_prev) {
-                double cross = ipv * Pq - qpv * Pi, dot = ipv * Pi + qpv * Pq;
-                double fe = atan2(cross * (dot < 0 ? -1.0 : 1.0), fabs(dot)) / (2.0 * PI * 0.001);
-                fcar += 0.25 * fe;
-            }
-            if (i == FLL_MS - 1) wint = 2.0 * PI * fcar;
-        } else {
-            double perr = atan2(Pq * (Pi < 0 ? -1.0 : 1.0), fabs(Pi));
-            wint += wn * wn * 0.001 * perr;
-            fcar = (wint + 2.0 * ZETA * wn * perr) / (2.0 * PI);
-        }
-        ipv = Pi; qpv = Pq; have_prev = 1;
-        i++;
-
-        if (i == FLL_MS + 200) {          /* lock check */
-            double si = 0, sq = 0;
-            for (int j = FLL_MS; j < i; j++) { si += fabs(c->ip[j]); sq += fabs(c->qp[j]); }
-            if (si < 2.0 * sq) { c->nep = i; return 0; }
-        }
+    /* grow arrays if needed */
+    if (i >= c->maxep) {
+        c->maxep *= 2;
+        c->ip   = (double *)realloc(c->ip,   sizeof(double) * c->maxep);
+        c->qp   = (double *)realloc(c->qp,   sizeof(double) * c->maxep);
+        c->epos = (double *)realloc(c->epos,  sizeof(double) * c->maxep);
     }
-    c->nep = i;
-    fprintf(stderr, "  PRN %2d: tracked %d ms, final carrier %.1f Hz\n", c->prn, i, fcar);
-    return i > FLL_MS + 400;
+
+    double step = CODE_RATE * (1.0 + c->fcar / F_L1) / FS;
+    double dphi = 2.0 * PI * c->fcar / FS;
+    const sample_t *x = stream_get(s, c->n, NS + 16);
+    if (!x) return 0;
+
+    c->epos[i] = (double)c->n - c->p / step;
+
+    double er = cos(c->phase), ei = -sin(c->phase);
+    double rr = cos(dphi),     ri = -sin(dphi);
+    double Pi = 0, Pq = 0, Ei = 0, Eq = 0, Li = 0, Lq = 0;
+    int k = 0;
+    double p = c->p;
+    while (p < 1023.0 && k < NS + 8) {
+        double xr = x[k].i, xi = x[k].q;
+        double sr = xr * er - xi * ei, si = xr * ei + xi * er;
+        double pe = p + 0.5, pl = p - 0.5;
+        double cp = c->code[cidx(p)], ce = c->code[cidx(pe)], cl = c->code[cidx(pl)];
+        Pi += sr * cp; Pq += si * cp;
+        Ei += sr * ce; Eq += si * ce;
+        Li += sr * cl; Lq += si * cl;
+        double t = er * rr - ei * ri; ei = er * ri + ei * rr; er = t;
+        p += step; k++;
+    }
+    c->n += k;
+    p -= 1023.0;
+    c->phase = fmod(c->phase + dphi * k, 2.0 * PI);
+    c->ip[i] = Pi;
+    c->qp[i] = Pq;
+
+    /* DLL: non-coherent early-late */
+    double Em = hypot(Ei, Eq), Lm = hypot(Li, Lq);
+    if (Em + Lm > 0) p += DLL_GAIN * 0.5 * (Em - Lm) / (Em + Lm);
+    c->p = p;
+
+    /* carrier loop */
+    double wn = PLL_BN / 0.53;
+    if (i < FLL_MS) {
+        if (c->have_prev) {
+            double cross = c->ipv * Pq - c->qpv * Pi;
+            double dot   = c->ipv * Pi + c->qpv * Pq;
+            double fe = atan2(cross * (dot < 0 ? -1.0 : 1.0),
+                              fabs(dot)) / (2.0 * PI * 0.001);
+            c->fcar += 0.25 * fe;
+        }
+        if (i == FLL_MS - 1) c->wint = 2.0 * PI * c->fcar;
+    } else {
+        double perr = atan2(Pq * (Pi < 0 ? -1.0 : 1.0), fabs(Pi));
+        c->wint += wn * wn * 0.001 * perr;
+        c->fcar = (c->wint + 2.0 * ZETA * wn * perr) / (2.0 * PI);
+    }
+    c->ipv = Pi; c->qpv = Pq; c->have_prev = 1;
+    c->nep = i + 1;
+
+    /* lock check at epoch FLL_MS + 200 */
+    if (i == FLL_MS + 199) {
+        double si = 0, sq = 0;
+        for (int j = FLL_MS; j <= i; j++) {
+            si += fabs(c->ip[j]);
+            sq += fabs(c->qp[j]);
+        }
+        if (si < 2.0 * sq) {
+            c->active = 0;
+            return -1;
+        }
+        c->locked = 1;
+        fprintf(stderr, "  PRN %2d: carrier locked, freq %.1f Hz\n",
+                c->prn, c->fcar);
+    }
+
+    return 1;
 }
 
 /* ------------------------- nav message --------------------------- */
@@ -352,10 +532,8 @@ static const int pm[6][16] = {
     {2,4,5,6,8,9,13,14,15,16,17,20,21,23,0},
     {1,3,5,6,7,9,10,14,15,16,17,18,21,22,24,0},
     {3,5,6,8,9,10,11,13,15,19,22,23,24,0}};
-static const int pstar[6] = {29, 30, 29, 30, 30, 29};   /* which D*  */
+static const int pstar[6] = {29, 30, 29, 30, 30, 29};
 
-/* bits: 300 raw bits of a subframe; d29/d30 from the previous word.
-   d[1..300] receives de-inverted data bits. Returns 1 if all parities OK. */
 static int parity_subframe(const char *bits, int d29, int d30, int *d)
 {
     for (int w = 0; w < 10; w++) {
@@ -376,36 +554,36 @@ static int parity_subframe(const char *bits, int d29, int d30, int *d)
 static void parse_subframe(const int *d, int id, eph_t *e)
 {
     if (id == 1) {
-        e->week = (int)getu(d, 61, 10);
+        e->week   = (int)getu(d, 61, 10);
         e->health = (int)getu(d, 77, 6);
-        e->iodc = (int)((getu(d, 83, 2) << 8) | getu(d, 211, 8));
-        e->tgd = gets_(d, 197, 8) * pow(2, -31);
-        e->toc = getu(d, 219, 16) * 16.0;
-        e->af2 = gets_(d, 241, 8) * pow(2, -55);
-        e->af1 = gets_(d, 249, 16) * pow(2, -43);
-        e->af0 = gets_(d, 271, 22) * pow(2, -31);
-        e->have1 = 1;
+        e->iodc   = (int)((getu(d, 83, 2) << 8) | getu(d, 211, 8));
+        e->tgd    = gets_(d, 197, 8)  * pow(2, -31);
+        e->toc    = getu(d, 219, 16)  * 16.0;
+        e->af2    = gets_(d, 241, 8)  * pow(2, -55);
+        e->af1    = gets_(d, 249, 16) * pow(2, -43);
+        e->af0    = gets_(d, 271, 22) * pow(2, -31);
+        e->have1  = 1;
     } else if (id == 2) {
         e->iode2 = (int)getu(d, 61, 8);
-        e->crs = gets_(d, 69, 16) * pow(2, -5);
-        e->dn = gets_(d, 91, 16) * pow(2, -43) * PI;
-        e->m0 = gets2(d, 107, 8, 121, 24) * pow(2, -31) * PI;
-        e->cuc = gets_(d, 151, 16) * pow(2, -29);
-        e->ecc = getu2(d, 167, 8, 181, 24) * pow(2, -33);
-        e->cus = gets_(d, 211, 16) * pow(2, -29);
-        e->sqrta = getu2(d, 227, 8, 241, 24) * pow(2, -19);
-        e->toe = getu(d, 271, 16) * 16.0;
+        e->crs   = gets_(d, 69, 16)                * pow(2, -5);
+        e->dn    = gets_(d, 91, 16)                * pow(2, -43) * PI;
+        e->m0    = gets2(d, 107, 8, 121, 24)       * pow(2, -31) * PI;
+        e->cuc   = gets_(d, 151, 16)               * pow(2, -29);
+        e->ecc   = getu2(d, 167, 8, 181, 24)       * pow(2, -33);
+        e->cus   = gets_(d, 211, 16)               * pow(2, -29);
+        e->sqrta = getu2(d, 227, 8, 241, 24)       * pow(2, -19);
+        e->toe   = getu(d, 271, 16)                * 16.0;
         e->have2 = 1;
     } else if (id == 3) {
-        e->cic = gets_(d, 61, 16) * pow(2, -29);
-        e->omg0 = gets2(d, 77, 8, 91, 24) * pow(2, -31) * PI;
-        e->cis = gets_(d, 121, 16) * pow(2, -29);
-        e->i0 = gets2(d, 137, 8, 151, 24) * pow(2, -31) * PI;
-        e->crc = gets_(d, 181, 16) * pow(2, -5);
-        e->omg = gets2(d, 197, 8, 211, 24) * pow(2, -31) * PI;
-        e->omgd = gets_(d, 241, 24) * pow(2, -43) * PI;
+        e->cic   = gets_(d, 61, 16)                * pow(2, -29);
+        e->omg0  = gets2(d, 77, 8, 91, 24)         * pow(2, -31) * PI;
+        e->cis   = gets_(d, 121, 16)               * pow(2, -29);
+        e->i0    = gets2(d, 137, 8, 151, 24)       * pow(2, -31) * PI;
+        e->crc   = gets_(d, 181, 16)               * pow(2, -5);
+        e->omg   = gets2(d, 197, 8, 211, 24)       * pow(2, -31) * PI;
+        e->omgd  = gets_(d, 241, 24)               * pow(2, -43) * PI;
         e->iode3 = (int)getu(d, 271, 8);
-        e->idot = gets_(d, 279, 14) * pow(2, -43) * PI;
+        e->idot  = gets_(d, 279, 14)               * pow(2, -43) * PI;
         e->have3 = 1;
     }
     if (e->have1 && e->have2 && e->have3 &&
@@ -430,6 +608,7 @@ static void decode_nav(chan_t *c)
     }
     static const int pre[8] = {1,0,0,0,1,0,1,1};
     int d[301];
+    c->nsf = 0;
     for (int b = 2; b + 300 <= nb; b++) {
         int m = 1, v = 1;
         for (int j = 0; j < 8; j++) {
@@ -477,7 +656,7 @@ static void sat_state(const eph_t *e, double ttx, double pos[3], double *dtsv)
     double tc = wrapw(ttx - e->toc);
     double dt = e->af0 + e->af1 * tc + e->af2 * tc * tc
               + F * e->ecc * e->sqrta * sin(E) - e->tgd;
-    double t = ttx - dt;                       /* system time of transmit */
+    double t = ttx - dt;
     double tk = wrapw(t - e->toe);
     kepler(e, tk, &E);
     double A = e->sqrta * e->sqrta;
@@ -496,7 +675,7 @@ static void sat_state(const eph_t *e, double ttx, double pos[3], double *dtsv)
 }
 
 /* ------------------------- position solution --------------------- */
-static int solve4(double A[4][5])   /* Gauss-Jordan on augmented 4x5 */
+static int solve4(double A[4][5])
 {
     for (int c = 0; c < 4; c++) {
         int pv = c;
@@ -522,7 +701,7 @@ static int lsq_fix(int n, double sp[][3], double rho[], double x[4], double *rms
             double dx = sp[i][0] - rx, dy = sp[i][1] - ry, dz = sp[i][2] - rz;
             double r0 = sqrt(dx*dx + dy*dy + dz*dz);
             double th = OMEGA_E * r0 / C_LIGHT, ct = cos(th), st = sin(th);
-            double sx = sp[i][0] * ct + sp[i][1] * st;      /* Earth rotation */
+            double sx = sp[i][0] * ct + sp[i][1] * st;
             double sy = -sp[i][0] * st + sp[i][1] * ct;
             double sz = sp[i][2];
             dx = sx - rx; dy = sy - ry; dz = sz - rz;
@@ -570,7 +749,7 @@ static void ecef2llh(const double x[3], double *lat, double *lon, double *h)
     *lat = la;
 }
 
-static int find_epoch(const chan_t *c, double S)   /* last i with epos[i] <= S */
+static int find_epoch(const chan_t *c, double S)
 {
     int lo = 0, hi = c->nep - 2;
     while (lo < hi) {
@@ -580,12 +759,61 @@ static int find_epoch(const chan_t *c, double S)   /* last i with epos[i] <= S *
     return lo;
 }
 
-static int run_pvt(chan_t *ch, int nch)
+/* compute a single PVT fix from the current channel states; returns 1 on success */
+static int pvt_snapshot(chan_t *ch, int nch, int *nfix,
+                        double *sumlat, double *sumlon, double *sumh)
 {
-    /* keep channels with ephemeris + time tag */
     chan_t *use[MAX_CH]; int nuse = 0;
     for (int i = 0; i < nch; i++)
-        if (ch[i].eph.valid && ch[i].have_t0 && nuse < MAX_CH) use[nuse++] = &ch[i];
+        if (ch[i].active && ch[i].eph.valid && ch[i].have_t0 && nuse < MAX_CH)
+            use[nuse++] = &ch[i];
+    if (nuse < 4) return 0;
+
+    /* find common sample-position window */
+    double S = 0;
+    int min_nep = INT_MAX;
+    for (int i = 0; i < nuse; i++)
+        if (use[i]->nep < min_nep) min_nep = use[i]->nep;
+    if (min_nep < FLL_MS + 200) return 0;
+    S = use[0]->epos[min_nep - 2];
+
+    double ttx[MAX_CH], tmax = 0;
+    for (int i = 0; i < nuse; i++) {
+        chan_t *c = use[i];
+        int e = find_epoch(c, S);
+        if (e < 0 || e + 1 >= c->nep) return 0;
+        double frac = (S - c->epos[e]) / (c->epos[e+1] - c->epos[e]);
+        ttx[i] = c->t0 + ((e - c->e0) + frac) * 0.001;
+        if (ttx[i] > tmax) tmax = ttx[i];
+    }
+
+    double trx = tmax + 0.070, sp[MAX_CH][3], rho[MAX_CH];
+    for (int i = 0; i < nuse; i++) {
+        double dtsv;
+        sat_state(&use[i]->eph, ttx[i], sp[i], &dtsv);
+        rho[i] = C_LIGHT * (trx - ttx[i]) + C_LIGHT * dtsv;
+    }
+
+    double x[4], rms, lat, lon, h;
+    if (!lsq_fix(nuse, sp, rho, x, &rms)) return 0;
+    ecef2llh(x, &lat, &lon, &h);
+    if (h < -1000 || h > 20000) return 0;
+
+    printf("%12.6f %12.6f %9.1f  %4d  %6.1f  %10.1f\n",
+           lat * 180 / PI, lon * 180 / PI, h, nuse, rms, x[3]);
+    fflush(stdout);
+
+    *sumlat += lat; *sumlon += lon; *sumh += h; (*nfix)++;
+    return 1;
+}
+
+/* batch PVT (original behavior for file mode) */
+static int run_pvt(chan_t *ch, int nch)
+{
+    chan_t *use[MAX_CH]; int nuse = 0;
+    for (int i = 0; i < nch; i++)
+        if (ch[i].active && ch[i].eph.valid && ch[i].have_t0 && nuse < MAX_CH)
+            use[nuse++] = &ch[i];
     if (nuse < 4) {
         fprintf(stderr, "Only %d satellites with ephemeris (need 4). Record a longer "
                         "file (90+ s) or improve signal.\n", nuse);
@@ -634,10 +862,48 @@ static int run_pvt(chan_t *ch, int nch)
 /* ------------------------- main ---------------------------------- */
 int main(int argc, char **argv)
 {
-    if (argc < 2) { fprintf(stderr, "usage: %s capture.iq\n", argv[0]); return 1; }
     stream_t s;
-    if (!stream_open(&s, argv[1])) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
-    fprintf(stderr, "File: %.1f s of data at %.3f MS/s assumed\n", s.total / FS, FS / 1e6);
+    int streaming;
+
+    if (argc >= 3 && strcmp(argv[1], "--tail") == 0) {
+        /* --- tail mode: read growing file written by GNURadio --- */
+        if (!stream_open_tail(&s, argv[2])) {
+            fprintf(stderr, "cannot open %s\n", argv[2]);
+            return 1;
+        }
+        fprintf(stderr, "Tail mode: reading growing file %s at %.3f MS/s\n"
+                        "  (start GNURadio recording, then this will follow)\n",
+                argv[2], FS / 1e6);
+        streaming = 1;
+    } else if (argc >= 2 && strcmp(argv[1], "-") != 0) {
+        /* --- file mode (original batch behavior) --- */
+        if (!stream_open_file(&s, argv[1])) {
+            fprintf(stderr, "cannot open %s\n", argv[1]);
+            return 1;
+        }
+        fprintf(stderr, "File: %.1f s of data at %.3f MS/s assumed\n",
+                s.total / FS, FS / 1e6);
+        streaming = 0;
+    } else {
+        /* --- streaming mode (stdin) --- */
+        if (!stream_open_stdin(&s)) {
+            fprintf(stderr, "cannot allocate stream buffer\n");
+            return 1;
+        }
+        fprintf(stderr, "Streaming mode: reading complex float32 IQ from stdin "
+                        "at %.3f MS/s\n", FS / 1e6);
+        streaming = 1;
+    }
+
+    /* ---- Phase 1: wait for enough data and acquire ---- */
+    long long acq_need = (long long)(ACQ_START_S * FS) + (long long)ACQ_MS * NS;
+    fprintf(stderr, "Waiting for %.1f s of data for acquisition...\n",
+            acq_need / FS);
+    if (!stream_fill(&s, acq_need)) {
+        fprintf(stderr, "not enough data for acquisition (need %.1f s)\n",
+                acq_need / FS);
+        return 1;
+    }
 
     long long start = (long long)(ACQ_START_S * FS);
     acq_t acq[64];
@@ -647,26 +913,140 @@ int main(int argc, char **argv)
         fprintf(stderr, "  PRN %2d  ratio %5.1f  doppler %7.0f Hz  codephase %4d\n",
                 acq[i].prn, acq[i].ratio, acq[i].dop, acq[i].cp);
     if (nacq < 4) {
-        fprintf(stderr, "Fewer than 4 satellites found: check antenna/bias-T/gain, "
-                        "or widen ACQ_DOPP_MAX.\n");
+        fprintf(stderr, "Fewer than 4 satellites found.\n");
         return 2;
     }
 
-    chan_t *ch = (chan_t *)calloc(nacq, sizeof(chan_t));
+    /* ---- Phase 2: initialize tracking channels ---- */
     int nch = 0;
-    for (int i = 0; i < nacq; i++) {
-        chan_t *c = &ch[nch];
-        c->prn = acq[i].prn;
-        if (!track(&s, start + acq[i].cp, acq[i].dop, c)) {
-            fprintf(stderr, "  PRN %2d: no carrier lock, dropped\n", c->prn);
-            free(c->ip); free(c->qp); free(c->epos); memset(c, 0, sizeof(*c));
-            continue;
-        }
-        decode_nav(c);
-        fprintf(stderr, "  PRN %2d: %d valid subframes, ephemeris %s\n",
-                c->prn, c->nsf, c->eph.valid ? "OK" : "incomplete");
+    chan_t ch[MAX_CH];
+    memset(ch, 0, sizeof(ch));
+    for (int i = 0; i < nacq && nch < MAX_CH; i++) {
+        ch[nch].prn = acq[i].prn;
+        track_init(&ch[nch], start + acq[i].cp, acq[i].dop);
         nch++;
     }
 
-    return run_pvt(ch, nch);
+    if (!streaming) {
+        /* ---- File mode: batch track, then decode, then PVT ---- */
+        int good = 0;
+        for (int i = 0; i < nch; i++) {
+            while (ch[i].active) {
+                int r = track_epoch(&s, &ch[i]);
+                if (r <= 0) {
+                    if (r == -1)
+                        fprintf(stderr, "  PRN %2d: no carrier lock, dropped\n",
+                                ch[i].prn);
+                    break;
+                }
+            }
+            if (!ch[i].active && !ch[i].locked) continue;
+            fprintf(stderr, "  PRN %2d: tracked %d ms, final carrier %.1f Hz\n",
+                    ch[i].prn, ch[i].nep, ch[i].fcar);
+            decode_nav(&ch[i]);
+            fprintf(stderr, "  PRN %2d: %d valid subframes, ephemeris %s\n",
+                    ch[i].prn, ch[i].nsf, ch[i].eph.valid ? "OK" : "incomplete");
+            if (ch[i].locked) good++;
+        }
+        return run_pvt(ch, nch);
+    }
+
+    /* ---- Phase 3: streaming processing loop ---- */
+    fprintf(stderr, "\nStreaming: tracking %d satellites, waiting for ephemeris...\n"
+                    "  (first fix typically takes 30-90 s)\n\n", nch);
+
+    printf("     lat(deg)     lon(deg)    alt(m)  nsat  rms(m)  clkbias(m)\n");
+    fflush(stdout);
+
+    int last_nav_epoch = 0;
+    int last_pvt_epoch = 0;
+    int last_status_epoch = 0;
+    int nfixes = 0;
+    double sumlat = 0, sumlon = 0, sumh = 0;
+    int had_first_fix = 0;
+
+    for (;;) {
+        int any_active = 0;
+        long long min_n = LLONG_MAX;
+
+        /* advance each channel by one epoch */
+        for (int i = 0; i < nch; i++) {
+            if (!ch[i].active) continue;
+            int r = track_epoch(&s, &ch[i]);
+            if (r <= 0) {
+                if (r == -1)
+                    fprintf(stderr, "  PRN %2d: no carrier lock, dropped\n",
+                            ch[i].prn);
+                if (r == 0 && s.eof) ch[i].active = 0;
+                continue;
+            }
+            any_active = 1;
+            if (ch[i].n < min_n) min_n = ch[i].n;
+        }
+
+        if (!any_active) break;
+
+        /* use first active channel's epoch count as time reference */
+        int ref_epoch = 0;
+        for (int i = 0; i < nch; i++)
+            if (ch[i].active) { ref_epoch = ch[i].nep; break; }
+
+        /* trim old samples to keep memory bounded */
+        if (min_n > NS * 4)
+            stream_trim(&s, min_n - NS * 4);
+
+        /* periodic status update (every 5 seconds) */
+        if (ref_epoch - last_status_epoch >= 5000) {
+            last_status_epoch = ref_epoch;
+            int nactive = 0, nlocked = 0, neph = 0;
+            for (int i = 0; i < nch; i++) {
+                if (ch[i].active) nactive++;
+                if (ch[i].active && ch[i].locked) nlocked++;
+                if (ch[i].active && ch[i].eph.valid) neph++;
+            }
+            fprintf(stderr, "[%5.1f s] active=%d locked=%d ephemeris=%d fixes=%d\n",
+                    ref_epoch / 1000.0, nactive, nlocked, neph, nfixes);
+        }
+
+        /* try nav decode every 2 seconds (only for channels without ephemeris) */
+        if (ref_epoch - last_nav_epoch >= 2000) {
+            last_nav_epoch = ref_epoch;
+            for (int i = 0; i < nch; i++) {
+                if (!ch[i].active || !ch[i].locked || ch[i].eph.valid) continue;
+                if (ch[i].nep < FLL_MS + 7000) continue;
+                decode_nav(&ch[i]);
+                if (ch[i].eph.valid)
+                    fprintf(stderr, "  PRN %2d: ephemeris complete (%d subframes)\n",
+                            ch[i].prn, ch[i].nsf);
+            }
+        }
+
+        /* try PVT every second */
+        if (ref_epoch - last_pvt_epoch >= 1000) {
+            last_pvt_epoch = ref_epoch;
+            if (pvt_snapshot(ch, nch, &nfixes, &sumlat, &sumlon, &sumh)) {
+                if (!had_first_fix) {
+                    fprintf(stderr, ">>> First fix at %.1f s <<<\n",
+                            ref_epoch / 1000.0);
+                    had_first_fix = 1;
+                }
+            }
+        }
+    }
+
+    /* final summary */
+    if (nfixes > 0) {
+        printf("\nMean of %d fixes: lat %.6f  lon %.6f  alt %.1f m\n",
+               nfixes,
+               sumlat / nfixes * 180 / PI,
+               sumlon / nfixes * 180 / PI,
+               sumh / nfixes);
+        printf("Google Maps: https://www.google.com/maps?q=%.6f,%.6f\n",
+               sumlat / nfixes * 180 / PI,
+               sumlon / nfixes * 180 / PI);
+    } else {
+        fprintf(stderr, "No valid fixes obtained.\n");
+    }
+
+    return nfixes > 0 ? 0 : 4;
 }

@@ -63,6 +63,24 @@ blocks:
     coordinate: [840, 472.0]
     rotation: 0
     state: enabled
+- name: network_tcp_sink_0
+  id: network_tcp_sink
+  parameters:
+    addr: 127.0.0.1
+    affinity: ''
+    alias: ''
+    comment: ''
+    mode: '2'
+    port: '5555'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [848, 316.0]
+    rotation: 0
+    state: disabled
 - name: osmosdr_source_0
   id: osmosdr_source
   parameters:
@@ -270,7 +288,7 @@ blocks:
     freq7: 100e6
     freq8: 100e6
     freq9: 100e6
-    gain0: '14'
+    gain0: '25'
     gain1: '10'
     gain10: '10'
     gain11: '10'
@@ -504,6 +522,7 @@ blocks:
 
 connections:
 - [osmosdr_source_0, '0', blocks_file_sink_0, '0']
+- [osmosdr_source_0, '0', network_tcp_sink_0, '0']
 - [osmosdr_source_0, '0', qtgui_freq_sink_x_0, '0']
 
 metadata:
