@@ -5,11 +5,40 @@
 - **SDR**: LimeSDR Mini v2.0 (serial: 1DBB8106DEEE92)
 - **Antenna**: Taoglas CGGBP.18.4.A.02 — passive ceramic patch GPS/GLONASS/Galileo/BeiDou antenna, 2.0 dBi gain at GPS L1, 50 ohm, SMA connector
 - **Connection**: Antenna SMA → LimeSDR RX SMA port (the port closest to the USB connector)
-- **USB**: Requires USB 3.0 port and cable. The LimeSDR Mini v2 uses an FTDI FT601 USB 3.0 bridge chip.
+- **USB**: The LimeSDR Mini v2 uses an FTDI FT601 USB 3.0 bridge chip. GPS at 4.096 MS/s needs ~16 MB/s, which USB 2.0 can also carry — and USB 3.0 streaming jams GPS reception with a passive antenna (see "USB 3.0 Self-Interference" below).
 
 ### Antenna Placement
 
 Same as HackRF — the Taoglas is a patch antenna. Place it **outdoors with the patch facing the sky** and an unobstructed view of the horizon. GPS L1 signals are ~-130 dBm and cannot be received indoors with a passive antenna.
+
+**Do not screw the passive antenna directly onto the LimeSDR.** Use an SMA extension cable (1–3 m) so the patch is well away from the board, the USB cable, and the laptop.
+
+### USB 3.0 Self-Interference (blocks GPS with a passive antenna)
+
+While the LimeSDR streams over USB 3.0, it radiates broadband noise in the GPS L1 band that a nearby passive antenna picks up, raising the noise floor by ~20 dB and burying the satellites. Measured October 2026, same antenna, same outdoor spot:
+
+| Measurement | Result |
+|---|---|
+| LimeSDR noise at 1575.42 MHz, antenna on vs. off | **+22 dB** (a clean passive antenna should add only a few dB) |
+| HackRF (USB 2.0) noise, antenna on vs. off | +2.3 dB |
+| HackRF acquisition, 60 s | **3 satellites** (PRN 8 ratio 9.1, PRN 2 5.0, PRN 7 4.3) |
+| LimeSDR acquisition, 60 s | 0 satellites (best ratio 1.40) |
+
+Using the HackRF as a noise probe next to the LimeSDR (HackRF noise at 1575.42 MHz):
+
+| LimeSDR state | HackRF noise |
+|---|---|
+| Unplugged / plugged in idle | baseline (idle ≤ +1 dB) |
+| RX fully configured (LO at 1575.42 MHz, ADCs running), **not streaming** | no change |
+| **Streaming** (any LO: 1000 / 1575 / 2400 MHz; any rate: 2–10 MS/s) | **+12.5 dB** (amp off) to +16.5 dB (amp on), flat across the band |
+
+The noise appears only while data is streaming over USB 3.0 and is independent of LO frequency and sample rate. This matches USB 3.0 link emissions (a continuous scrambled 5 Gbps signal while transferring), not the LMS7002M RF chain. The USB 3.0 cable and the on-board FT601 can't be told apart with these tests.
+
+Fixes, roughly in order of cost:
+1. **USB 2.0-only cable or USB 2.0 hub.** The FT601 falls back to 480 Mbps, enough for 4.096 MS/s. Untested. Note: a small USB-A→C adapter may contain a USB 3.0 hub (check `cat /sys/bus/usb/devices/<dev>/speed`: `480` = USB 2.0, `5000` = USB 3.0). Disabling the SuperSpeed port in sysfs (`usbN-portM/disable`) did **not** work on the HP Envy x360 — the device did not re-enumerate at all.
+2. **SMA extension cable** plus a metal ground plane under the patch, to distance the antenna from the board and USB cable.
+3. **Ferrite chokes** on the USB cable and a **shielded enclosure** for the board.
+4. **Active GPS antenna + external bias tee** (the LimeSDR Mini has no bias tee). The antenna's LNA raises the signal before local noise is added — the most robust fix.
 
 ## LimeSDR Mini v2 RF Architecture
 
@@ -201,7 +230,11 @@ g++ -O2 -std=c++17 gps/gps_capture.cpp -o gps_capture \
 ./gps_capture /tmp/gps_capture.bin 30
 ```
 
-The program configures: LNAW antenna, 1575.42 MHz, 4.096 MS/s, LNA=30 TIA=12 PGA=19, and writes raw complex float32 IQ to file. A healthy 10 s capture is 40,960,000 samples (327.68 MB) in ~10.0 s; if it takes ~100x longer, check the gateware version.
+The program configures: LNAW antenna, 1575.42 MHz, 4.096 MS/s, LNA=30 TIA=12 PGA=19, DC/IQ calibration, and writes raw complex float32 IQ to file.
+
+DC/IQ calibration (`CalibrationFlag::DCIQ`) is required on LNAW: without it the Q channel is ~4x the I channel (~12 dB imbalance). LNAH is balanced either way. The first ~0.5 s of every capture contains start-up transients; `gps_rx` starts acquisition at 0.5 s so this is harmless.
+
+A healthy 10 s capture is 40,960,000 samples (327.68 MB) in ~10.0 s; if it takes ~100x longer, check the gateware version.
 
 **Note**: `sudo` is only required if the udev rules are missing. LimeSuiteNG's `make install` installs them; to install manually:
 ```bash
@@ -268,6 +301,9 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 - LimeSuiteNG FT601 streaming bug. Known issue — no fix as of Oct 2026.
 
 ### 0 satellites acquired (all ratios ~1.0)
+- **USB 3.0 self-interference** (most likely with a passive antenna on the LimeSDR): measure the noise floor at 1575.42 MHz with the antenna connected and disconnected. A rise of more than a few dB means local interference — see "USB 3.0 Self-Interference".
+- **Cross-check with the HackRF**: if the HackRF acquires satellites with the same antenna and spot, the antenna and sky view are fine.
+- **Check I/Q balance**: Q/I rms ratio should be ~1.0. If it is ~4, DC/IQ calibration is not enabled.
 - **Check antenna path**: gateware v2.2 forces LNAH regardless of software setting. Flash v3.11 or accept weak signal.
 - **Check antenna placement**: must be outdoors, patch facing sky, SMA tight.
 - **Try higher gains**: max out LNA=30, TIA=12, PGA=19.
@@ -278,11 +314,13 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 
 ## Current Status (October 2026)
 
-**GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of three bugs:
+**GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of three bugs (plus the USB 3.0 interference issue below, which affects every OS):
 1. Gateware v2.2 RF switch bug routes GPS to wrong antenna (LNAH)
 2. Gateware v3.12 streams at ~1% of the configured rate (on any OS)
 3. LimeSuiteNG (needed for gateware v3.x) has a Windows FT601 streaming bug
 
-**Working path**: Native Linux (Ubuntu 26.04) + **gateware v3.11** + LimeSuiteNG — confirmed full-rate streaming (4.096 MS/s, zero loss) with LNAW selected, and the capture → `gps_rx` pipeline runs end to end (no antenna connected during the test, so 0 satellites as expected).
+**Software/gateware path that works**: Native Linux (Ubuntu 26.04) + **gateware v3.11** + LimeSuiteNG + DC/IQ calibration — confirmed full-rate streaming (4.096 MS/s, zero loss) with LNAW selected, and the capture → `gps_rx` pipeline runs end to end.
 
-**Recommended next step**: Outdoor capture with the antenna on native Linux to confirm GPS acquisition (peak ratios > 1.8) and that LNAW is physically selected by v3.11.
+**Outdoor result (Oct 2026): 0 satellites on the LimeSDR**, because USB 3.0 streaming raises the noise floor at L1 by ~20 dB when the passive antenna is mounted directly on the board (see "USB 3.0 Self-Interference"). The HackRF with the same antenna at the same spot acquired 3 satellites, so the antenna, location and `gps_rx` are fine.
+
+**Recommended next step**: Repeat the outdoor capture with one of the interference fixes — a USB 2.0-only cable or hub, an SMA extension cable to move the antenna away from the board, or an active antenna with a bias tee. Until then, use the HackRF for GPS.
