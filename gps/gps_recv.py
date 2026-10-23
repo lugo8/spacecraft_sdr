@@ -1,143 +1,91 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Headless GPS capture using GNURadio + osmosdr (LimeSDR or HackRF).
 
-#
-# SPDX-License-Identifier: GPL-3.0
-#
-# GNU Radio Python Flow Graph
-# Title: Not titled yet
-# Author: biote
-# GNU Radio version: 3.10.12.0
+Usage:
+  python gps_recv.py [--device DEVICE] [--antenna ANT] [--seconds N] [--output FILE]
 
-from PyQt5 import Qt
-from gnuradio import qtgui
-from gnuradio import blocks
-from gnuradio import gr
-from gnuradio.filter import firdes
-from gnuradio.fft import window
-import sys
+Examples:
+  python gps_recv.py --device "driver=lime,soapy=0" --antenna LNAW
+  python gps_recv.py --device "" --antenna ""   # HackRF (default osmosdr)
+"""
+import argparse
 import signal
-from PyQt5 import Qt
-from argparse import ArgumentParser
-from gnuradio.eng_arg import eng_float, intx
-from gnuradio import eng_notation
-import osmosdr
+import sys
 import time
-import threading
+
+from gnuradio import gr, blocks
+import osmosdr
 
 
+class GPSReceiver(gr.top_block):
+    def __init__(self, device_args, antenna, output_file, samp_rate=4.096e6):
+        gr.top_block.__init__(self, "GPS Receiver")
 
-class gps_recv(gr.top_block, Qt.QWidget):
+        self.source = osmosdr.source(args=device_args)
+        self.source.set_sample_rate(samp_rate)
+        self.source.set_center_freq(1575.42e6, 0)
+        self.source.set_freq_corr(0, 0)
 
-    def __init__(self):
-        gr.top_block.__init__(self, "Not titled yet", catch_exceptions=True)
-        Qt.QWidget.__init__(self)
-        self.setWindowTitle("Not titled yet")
-        qtgui.util.check_set_qss()
-        try:
-            self.setWindowIcon(Qt.QIcon.fromTheme('gnuradio-grc'))
-        except BaseException as exc:
-            print(f"Qt GUI: Could not set Icon: {str(exc)}", file=sys.stderr)
-        self.top_scroll_layout = Qt.QVBoxLayout()
-        self.setLayout(self.top_scroll_layout)
-        self.top_scroll = Qt.QScrollArea()
-        self.top_scroll.setFrameStyle(Qt.QFrame.NoFrame)
-        self.top_scroll_layout.addWidget(self.top_scroll)
-        self.top_scroll.setWidgetResizable(True)
-        self.top_widget = Qt.QWidget()
-        self.top_scroll.setWidget(self.top_widget)
-        self.top_layout = Qt.QVBoxLayout(self.top_widget)
-        self.top_grid_layout = Qt.QGridLayout()
-        self.top_layout.addLayout(self.top_grid_layout)
+        if "lime" in device_args.lower():
+            self.source.set_gain(30, 0)       # LNA
+            self.source.set_if_gain(12, 0)    # TIA
+            self.source.set_bb_gain(19, 0)    # PGA
+            self.source.set_dc_offset_mode(2, 0)  # auto
+            self.source.set_bandwidth(5e6, 0)
+        else:
+            self.source.set_gain(25, 0)       # RF
+            self.source.set_if_gain(40, 0)
+            self.source.set_bb_gain(40, 0)
+            self.source.set_dc_offset_mode(0, 0)
 
-        self.settings = Qt.QSettings("gnuradio/flowgraphs", "gps_recv")
+        if antenna:
+            self.source.set_antenna(antenna, 0)
 
-        try:
-            geometry = self.settings.value("geometry")
-            if geometry:
-                self.restoreGeometry(geometry)
-        except BaseException as exc:
-            print(f"Qt GUI: Could not restore geometry: {str(exc)}", file=sys.stderr)
-        self.flowgraph_started = threading.Event()
+        self.source.set_bandwidth(0, 0)
 
-        ##################################################
-        # Variables
-        ##################################################
-        self.samp_rate = samp_rate = 4.096e6
+        self.sink = blocks.file_sink(gr.sizeof_gr_complex, output_file, False)
+        self.sink.set_unbuffered(False)
 
-        ##################################################
-        # Blocks
-        ##################################################
-
-        self.osmosdr_source_0 = osmosdr.source(
-            args="numchan=" + str(1) + " " + ""
-        )
-        self.osmosdr_source_0.set_clock_source('gpsdo', 0)
-        self.osmosdr_source_0.set_time_unknown_pps(osmosdr.time_spec_t())
-        self.osmosdr_source_0.set_sample_rate(samp_rate)
-        self.osmosdr_source_0.set_center_freq(1575.42e6, 0)
-        self.osmosdr_source_0.set_freq_corr(0, 0)
-        self.osmosdr_source_0.set_dc_offset_mode(0, 0)
-        self.osmosdr_source_0.set_iq_balance_mode(0, 0)
-        self.osmosdr_source_0.set_gain_mode(False, 0)
-        self.osmosdr_source_0.set_gain(25, 0)
-        self.osmosdr_source_0.set_if_gain(40, 0)
-        self.osmosdr_source_0.set_bb_gain(40, 0)
-        self.osmosdr_source_0.set_antenna('', 0)
-        self.osmosdr_source_0.set_bandwidth(0, 0)
-        self.blocks_file_sink_0 = blocks.file_sink(gr.sizeof_gr_complex*1, 'Microsoft.PowerShell.Core\\FileSystem::\\\\wsl.localhost\\Ubuntu\\tmp\\gps_iq', False)
-        self.blocks_file_sink_0.set_unbuffered(False)
+        self.connect((self.source, 0), (self.sink, 0))
 
 
-        ##################################################
-        # Connections
-        ##################################################
-        self.connect((self.osmosdr_source_0, 0), (self.blocks_file_sink_0, 0))
+def main():
+    parser = argparse.ArgumentParser(description="GPS IQ capture")
+    parser.add_argument("--device", default="driver=lime,soapy=0",
+                        help="osmosdr device string")
+    parser.add_argument("--antenna", default="LNAW",
+                        help="Antenna port (LNAW for LimeSDR, empty for HackRF)")
+    parser.add_argument("--seconds", type=int, default=0,
+                        help="Capture duration (0 = run until Ctrl+C)")
+    parser.add_argument("--output", default="gps_captured.iq",
+                        help="Output file path")
+    args = parser.parse_args()
 
+    tb = GPSReceiver(args.device, args.antenna, args.output)
 
-    def closeEvent(self, event):
-        self.settings = Qt.QSettings("gnuradio/flowgraphs", "gps_recv")
-        self.settings.setValue("geometry", self.saveGeometry())
-        self.stop()
-        self.wait()
-
-        event.accept()
-
-    def get_samp_rate(self):
-        return self.samp_rate
-
-    def set_samp_rate(self, samp_rate):
-        self.samp_rate = samp_rate
-        self.osmosdr_source_0.set_sample_rate(self.samp_rate)
-
-
-
-
-def main(top_block_cls=gps_recv, options=None):
-
-    qapp = Qt.QApplication(sys.argv)
-
-    tb = top_block_cls()
-
-    tb.start()
-    tb.flowgraph_started.set()
-
-    tb.show()
-
-    def sig_handler(sig=None, frame=None):
+    def stop_handler(sig, frame):
+        print("\nStopping capture...")
         tb.stop()
         tb.wait()
+        sys.exit(0)
 
-        Qt.QApplication.quit()
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
 
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
+    print(f"Starting GPS capture: device={args.device} antenna={args.antenna}")
+    print(f"Output: {args.output}")
+    tb.start()
 
-    timer = Qt.QTimer()
-    timer.start(500)
-    timer.timeout.connect(lambda: None)
+    if args.seconds > 0:
+        print(f"Capturing for {args.seconds} seconds...")
+        time.sleep(args.seconds)
+        tb.stop()
+        tb.wait()
+        print("Done.")
+    else:
+        print("Capturing until Ctrl+C...")
+        tb.wait()
 
-    qapp.exec_()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
