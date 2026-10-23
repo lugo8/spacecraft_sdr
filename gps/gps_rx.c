@@ -27,6 +27,7 @@
  */
 #define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* usleep() on glibc */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,9 +175,9 @@ static int stream_read_more(stream_t *s, long long need_total)
 
 static const sample_t *stream_get(stream_t *s, long long n, long long need)
 {
-    if (n < s->base) return NULL;
-
     if (s->mode == STREAM_MODE_STDIN || s->mode == STREAM_MODE_TAIL) {
+        /* streamed samples before base were trimmed and can't be re-read */
+        if (n < s->base) return NULL;
         if (!stream_read_more(s, n + need)) return NULL;
         return s->buf + (n - s->base);
     } else {

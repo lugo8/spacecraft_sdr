@@ -26,35 +26,66 @@ The LimeSDR Mini v2 has two RX LNA paths controlled by an RF switch:
 
 The factory gateware (v2.2) has a bug: **the RF switch always routes the RX SMA to LNAH**, regardless of what the software selects. This means even if you set `antenna=LNAW`, GPS signal still goes through the wrong amplifier.
 
-- **Gateware v3.12** fixes this bug — LNAW is properly connected when selected.
+- **Gateware v3.x** fixes this bug — LNAW is properly connected when selected.
 - Confirmed by measurement: LNAW std=75.7 vs LNAH std=65.9 at 1575 MHz with gateware v3.12.
+
+### Gateware v3.12 Streaming Bug — use v3.11
+
+**Gateware v3.12 delivers only ~1% of the configured sample rate** (e.g. ~40 kS/s when 4.096 MS/s is requested). This happens on every OS and host library tested — it is a gateware bug, not a driver/USB issue:
+
+- The FPGA's own hardware timestamps advance at ~1/103 of the configured rate, with **zero** packet loss/overrun — the board simply produces too few samples.
+- The ratio is constant across sample rates (4.096 / 10 / 20 MS/s), link formats (I12/I16), oversample settings, and with TX enabled or disabled.
+- LMS7002M clocks (CGEN locked, RXTSP correct) read back fine.
+- v3.12 release notes list a change to Mini V1/V2 clock configuration, the likely culprit.
+
+**Gateware v3.11 streams at full rate** (measured on native Linux with LimeSuiteNG, Oct 2026):
+
+| Requested | v3.12 | v3.11 |
+|-----------|-------|-------|
+| 4.096 MS/s | 39.6 kS/s | 4.096 MS/s, 0 loss |
+| 10 MS/s | 96.7 kS/s | 9.99 MS/s, 0 loss |
+
+With v3.11 the RX RF switch register (FPGA `0x0017` bits 9:8) reads `0x2` = LNAW when LNAW is selected. Physical routing to LNAW still needs to be confirmed with an outdoor capture.
 
 ### Gateware Locations
 
 | Version | File | Size |
 |---------|------|------|
-| v2.2 (factory) | `%APPDATA%\LimeSuite\images\23.11\LimeSDR-Mini_HW_2.0_r2.2.bit` | 1,074,354 bytes |
-| v3.12 (RF fix) | Downloaded from [Lime Micro releases](https://github.com/myriadrf/LimeSDR-Mini-v2_GW/releases) | 663,350 bytes |
+| v2.2 (factory) | `%APPDATA%\LimeSuite\images\23.11\LimeSDR-Mini_HW_2.0_r2.2.bit`, or https://downloads.myriadrf.org/project/limesuite/23.11/LimeSDR-Mini_HW_2.0_r2.2.bit | 1,074,354 bytes |
+| **v3.11 (recommended)** | `LimeSDR_GW/bitstream/LimeSDR_Mini_V2/limesdr_mini_v2.bit` inside `LimeSDR_GW_v3.11_bitstream.zip` from [LimeSDR_GW releases](https://github.com/myriadrf/LimeSDR_GW/releases/tag/v3.11) | 626,914 bytes |
+| v3.12 (streaming bug) | Same path inside `LimeSDR_GW_v3.12_bitstream.zip` from [LimeSDR_GW releases](https://github.com/myriadrf/LimeSDR_GW/releases/tag/v3.12) | 663,350 bytes |
+
+Use `limesdr_mini_v2.bit`, not `limesdr_mini_v2_golden.bit` or the `.mcs`.
 
 ### Flashing Gateware
 
+With LimeSuiteNG (Linux):
+```bash
+limeFLASH -t FPGA/FLASH limesdr_mini_v2.bit
+```
+
+With old LimeSuite:
 ```
 LimeUtil --update --fpga=<path_to_bitstream.bit>
 ```
 
-**Warning**: Gateware v3.12 is **not compatible** with old LimeSuite (v23.11.0). It requires LimeSuiteNG. See compatibility matrix below.
+- Flashing is slow: **~1.6 KB/s** (≈7 min for v3.11, ≈11 min for v2.2). Do **not** wrap it in a `timeout` or unplug the board mid-flash — an interrupted write leaves a partial image in flash, and the board may not boot it after power loss. If a flash is interrupted, the FPGA keeps running the old image from RAM until power-cycled, so immediately re-flash a complete image.
+- After "Programming completed", **unplug and replug** the board to boot the new gateware. Confirm with `limeDevice --full` (Gateware version / revision).
+
+**Warning**: Gateware v3.x is **not compatible** with old LimeSuite (v23.11.0). It requires LimeSuiteNG. See compatibility matrix below.
 
 ## Software Compatibility Matrix
 
 | Gateware | Software | OS | Streaming | GPS Viable? | Notes |
 |----------|----------|-----|-----------|-------------|-------|
 | v2.2 | LimeSuite v23.11.0 | Windows | Full speed (~32 MB/s) | No — LNAH only (RF switch bug) | Signal too weak for acquisition |
-| v3.12 | LimeSuite v23.11.0 | Windows | ~100x too slow | No | USB protocol mismatch between old software and new gateware |
+| v3.12 | LimeSuite v23.11.0 | Windows | ~100x too slow | No | v3.12 gateware streaming bug (originally blamed on a protocol mismatch) |
 | v3.12 | LimeSuiteNG (develop) | Windows | Zero packets | No | Known FT601 streaming bug on Windows |
-| v3.12 | LimeSuiteNG (develop) | Linux (native) | Full speed | **Yes** | Uses libusb, not FT601 D3XX |
-| v3.12 | LimeSuiteNG (develop) | WSL2 + usbipd | ~1% throughput | No | USB/IP protocol too slow for bulk transfers |
+| v3.12 | LimeSuiteNG (develop) | Linux (native) | ~1% of requested rate | No | v3.12 gateware streaming bug |
+| v3.12 | LimeSuiteNG (develop) | WSL2 + usbipd | ~1% throughput | No | Most likely the same v3.12 gateware bug (originally blamed on USB/IP) |
+| **v3.11** | **LimeSuiteNG (develop, 5bc2d182)** | **Linux (native, Ubuntu 26.04)** | **Full speed** | **Yes (pending outdoor test)** | Uses libusb, not FT601 D3XX |
 
-**Bottom line**: As of October 2026, the only working full-speed configuration for GPS is **gateware v3.12 + LimeSuiteNG on native Linux**.
+**Bottom line**: As of October 2026, the working full-speed configuration for GPS is **gateware v3.11 + LimeSuiteNG on native Linux**. Avoid v3.12. v3.11 with LimeSuiteNG on Windows/WSL2 has not been tested; the Windows FT601 zero-packet bug is a host-side issue and probably still applies there.
 
 ## Windows Driver
 
@@ -73,18 +104,19 @@ Radioconda PATH setup for command-line use:
 $env:PATH = "$env:USERPROFILE\radioconda;$env:USERPROFILE\radioconda\Library\mingw-w64\bin;$env:USERPROFILE\radioconda\Library\usr\bin;$env:USERPROFILE\radioconda\Library\bin;$env:USERPROFILE\radioconda\Scripts;$env:USERPROFILE\radioconda\bin;$env:PATH"
 ```
 
-### LimeSuiteNG (required for gateware v3.12)
+### LimeSuiteNG (required for gateware v3.x)
 
-Old LimeSuite (bundled with Radioconda as `LMS7Support.dll`) does NOT work with gateware v3.12. You must build LimeSuiteNG from source.
+Old LimeSuite (bundled with Radioconda as `LMS7Support.dll`) does NOT work with gateware v3.x. You must build LimeSuiteNG from source.
 
 #### Building on Linux (recommended)
 
-```bash
-sudo apt-get install -y cmake libusb-1.0-0-dev g++ make
+Tested on Ubuntu 26.04 with LimeSuiteNG `develop` at commit `5bc2d182`.
 
-git clone https://github.com/myriadrf/LimeSuiteNG.git
+```bash
+sudo apt-get install -y build-essential cmake pkg-config libusb-1.0-0-dev
+
+git clone -b develop https://github.com/myriadrf/LimeSuiteNG.git
 cd LimeSuiteNG
-git checkout develop
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_GUI=OFF -DBUILD_DOCS=OFF \
@@ -94,7 +126,12 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j$(nproc)
 sudo make -C build install
 sudo ldconfig
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
+
+`make install` also installs the udev rules (`/etc/udev/rules.d/65-limesuiteng-usb.rules`), so after replugging the board no `sudo` is needed to use it. Verify with `limeDevice --full`.
+
+`sudo` needs a real terminal for the password; run these in a normal terminal, not through a non-interactive shell.
 
 #### Building on Windows (MSVC — streaming broken as of Oct 2026)
 
@@ -153,7 +190,7 @@ Or use the headless script:
 $env:USERPROFILE\radioconda\python.exe gps\gps_recv.py --device "driver=lime,soapy=0" --antenna LNAW --seconds 90 --output gps_captured.iq
 ```
 
-### Method 2: LimeSuiteNG C++ capture (Linux — for gateware v3.12)
+### Method 2: LimeSuiteNG C++ capture (Linux — for gateware v3.11)
 
 A custom capture program (`gps/gps_capture.cpp`) uses the LimeSuiteNG API directly:
 
@@ -161,20 +198,20 @@ A custom capture program (`gps/gps_capture.cpp`) uses the LimeSuiteNG API direct
 g++ -O2 -std=c++17 gps/gps_capture.cpp -o gps_capture \
   -I/usr/local/include -L/usr/local/lib -llimesuiteng -Wl,-rpath,/usr/local/lib
 
-sudo ./gps_capture /tmp/gps_capture.bin 30
+./gps_capture /tmp/gps_capture.bin 30
 ```
 
-The program configures: LNAW antenna, 1575.42 MHz, 4.096 MS/s, LNA=30 TIA=12 PGA=19, and writes raw complex float32 IQ to file.
+The program configures: LNAW antenna, 1575.42 MHz, 4.096 MS/s, LNA=30 TIA=12 PGA=19, and writes raw complex float32 IQ to file. A healthy 10 s capture is 40,960,000 samples (327.68 MB) in ~10.0 s; if it takes ~100x longer, check the gateware version.
 
-**Note**: `sudo` is required unless udev rules are installed. To install udev rules:
+**Note**: `sudo` is only required if the udev rules are missing. LimeSuiteNG's `make install` installs them; to install manually:
 ```bash
-sudo cp ~/LimeSuiteNG/udev-rules/64-limesuite.rules /etc/udev/rules.d/
+sudo cp ~/LimeSuiteNG/udev-rules/65-limesuiteng-usb.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 ### Method 3: WSL2 + usbipd (not viable for GPS)
 
-USB passthrough via usbipd-win works for device detection and low-rate control, but bulk streaming throughput is ~1% of native — not enough for continuous GPS capture.
+USB passthrough via usbipd-win works for device detection and low-rate control. Streaming measured ~1% of native, but that test used gateware v3.12, whose streaming bug produces exactly this rate — so the USB/IP diagnosis is unconfirmed. Untested with v3.11.
 
 Setup (for reference):
 ```powershell
@@ -192,6 +229,12 @@ After capturing IQ data (by any method), run the GPS software receiver:
 
 ```
 gps\gps_rx.exe [--tail] <iq_file>
+```
+
+On Linux, build it locally (the checked-in `gps/gps_rx` binary was built with `-march=native` on another machine and may crash with "Illegal instruction"):
+```bash
+gcc -O3 -march=native -o gps_rx gps/gps_rx.c -lm
+./gps_rx /tmp/gps_capture.bin
 ```
 
 - **File mode**: Process a completed capture file
@@ -215,14 +258,17 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 - On Linux: check `lsusb` for `0403:601f` and USB permissions
 
 ### Streaming too slow (~100x)
-- Gateware v3.12 + old LimeSuite = protocol mismatch. Must use LimeSuiteNG.
-- WSL2 + usbipd = USB/IP overhead. Must use native Linux.
+- **Gateware v3.12 streaming bug** — check `limeDevice --full`; if it reports Gateware version 3 / revision 12, flash v3.11 (see "Gateware v3.12 Streaming Bug").
+- Gateware v3.x + old LimeSuite is unsupported. Must use LimeSuiteNG.
+
+### `gps_rx` crashes with "Illegal instruction"
+- The binary was built for a different CPU. Rebuild from `gps/gps_rx.c` on the machine running it.
 
 ### Zero packets on Windows
 - LimeSuiteNG FT601 streaming bug. Known issue — no fix as of Oct 2026.
 
 ### 0 satellites acquired (all ratios ~1.0)
-- **Check antenna path**: gateware v2.2 forces LNAH regardless of software setting. Flash v3.12 or accept weak signal.
+- **Check antenna path**: gateware v2.2 forces LNAH regardless of software setting. Flash v3.11 or accept weak signal.
 - **Check antenna placement**: must be outdoors, patch facing sky, SMA tight.
 - **Try higher gains**: max out LNA=30, TIA=12, PGA=19.
 - **Try longer integration**: increase `ACQ_MS` to 40 in `gps_rx.c` and lower `ACQ_THRESH` to 1.5.
@@ -232,10 +278,11 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 
 ## Current Status (October 2026)
 
-**GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of two bugs:
+**GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of three bugs:
 1. Gateware v2.2 RF switch bug routes GPS to wrong antenna (LNAH)
-2. LimeSuiteNG (needed for gateware v3.12 fix) has a Windows FT601 streaming bug
+2. Gateware v3.12 streams at ~1% of the configured rate (on any OS)
+3. LimeSuiteNG (needed for gateware v3.x) has a Windows FT601 streaming bug
 
-**Working path**: Native Linux + gateware v3.12 + LimeSuiteNG — confirmed streaming at correct rate with LNAW antenna. GPS acquisition testing pending (need outdoor capture on native Linux).
+**Working path**: Native Linux (Ubuntu 26.04) + **gateware v3.11** + LimeSuiteNG — confirmed full-rate streaming (4.096 MS/s, zero loss) with LNAW selected, and the capture → `gps_rx` pipeline runs end to end (no antenna connected during the test, so 0 satellites as expected).
 
-**Recommended next step**: Boot Linux natively (or dual-boot) and run the capture pipeline with gateware v3.12 + LimeSuiteNG.
+**Recommended next step**: Outdoor capture with the antenna on native Linux to confirm GPS acquisition (peak ratios > 1.8) and that LNAW is physically selected by v3.11.
