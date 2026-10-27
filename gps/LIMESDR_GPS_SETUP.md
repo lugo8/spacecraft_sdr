@@ -5,13 +5,13 @@
 - **SDR**: LimeSDR Mini v2.0 (serial: 1DBB8106DEEE92)
 - **Antenna**: Taoglas CGGBP.18.4.A.02 — passive ceramic patch GPS/GLONASS/Galileo/BeiDou antenna, 2.0 dBi gain at GPS L1, 50 ohm, SMA connector
 - **Connection**: Antenna SMA → LimeSDR RX SMA port (the port closest to the USB connector)
-- **USB**: The LimeSDR Mini v2 uses an FTDI FT601 USB 3.0 bridge chip. GPS at 4.096 MS/s needs ~16 MB/s, which USB 2.0 can also carry — and USB 3.0 streaming jams GPS reception with a passive antenna (see "USB 3.0 Self-Interference" below).
+- **USB**: The LimeSDR Mini v2 uses an FTDI FT601 USB 3.0 bridge chip. USB 3.0 streaming jams GPS reception with a passive antenna (see "USB 3.0 Self-Interference" below), and this board does not enumerate on USB 2.0.
 
 ### Antenna Placement
 
 Same as HackRF — the Taoglas is a patch antenna. Place it **outdoors with the patch facing the sky** and an unobstructed view of the horizon. GPS L1 signals are ~-130 dBm and cannot be received indoors with a passive antenna.
 
-**Do not screw the passive antenna directly onto the LimeSDR.** Use an SMA extension cable (1–3 m) so the patch is well away from the board, the USB cable, and the laptop.
+**Do not screw the passive antenna directly onto the LimeSDR.** Use an SMA extension cable (1–3 m) so the patch is well away from the board, the USB cable, and the laptop. A 30 cm extension alone was not enough (see below).
 
 ### USB 3.0 Self-Interference (blocks GPS with a passive antenna)
 
@@ -34,11 +34,22 @@ Using the HackRF as a noise probe next to the LimeSDR (HackRF noise at 1575.42 M
 
 The noise appears only while data is streaming over USB 3.0 and is independent of LO frequency and sample rate. This matches USB 3.0 link emissions (a continuous scrambled 5 Gbps signal while transferring), not the LMS7002M RF chain. The USB 3.0 cable and the on-board FT601 can't be told apart with these tests.
 
-Fixes, roughly in order of cost:
-1. **USB 2.0-only cable or USB 2.0 hub.** The FT601 falls back to 480 Mbps, enough for 4.096 MS/s. Untested. Note: a small USB-A→C adapter may contain a USB 3.0 hub (check `cat /sys/bus/usb/devices/<dev>/speed`: `480` = USB 2.0, `5000` = USB 3.0). Disabling the SuperSpeed port in sysfs (`usbN-portM/disable`) did **not** work on the HP Envy x360 — the device did not re-enumerate at all.
-2. **SMA extension cable** plus a metal ground plane under the patch, to distance the antenna from the board and USB cable.
-3. **Ferrite chokes** on the USB cable and a **shielded enclosure** for the board.
-4. **Active GPS antenna + external bias tee** (the LimeSDR Mini has no bias tee). The antenna's LNA raises the signal before local noise is added — the most robust fix.
+Fixes tried and remaining, roughly in order of cost:
+1. **USB 2.0 — does not work with this board.** In theory the FT601 falls back to 480 Mbps (enough for 4.096 MS/s), but this LimeSDR never enumerated on USB 2.0: not through a genuine USB 2.0 hub (QinHeng `1a86:8095`, 480 Mbps; board LED on, but no connect attempt at all in the kernel log), and not with the SuperSpeed port disabled in sysfs (`usbN-portM/disable`). Note: a small USB-A→C adapter may contain a USB 3.0 hub (check `cat /sys/bus/usb/devices/<dev>/speed`: `480` = USB 2.0, `5000` = USB 3.0).
+2. **SMA extension cable — helps but not enough on its own.** A 30 cm (1 ft) extension lowered the L1 noise from −22.6 to **−34.5 dBFS (−12 dB)**, still ~10 dB above the no-antenna floor (−44.4 dBFS). The LimeSDR still acquired 0 satellites (best ratio 1.42), while the HackRF through the same extension got a full fix (see table below). Longer cables (1–3 m) should help further.
+3. **Metal sheet as shield + ground plane** (untested): antenna PCB on top of a baking tray / foil-covered board, patch facing up; LimeSDR and USB cable underneath, cable leading away. The antenna's own PCB ground plane (Taoglas specifies a 70 × 70 mm plane) only shields directly below it.
+4. **Ferrite chokes** on the USB cable and a **shielded enclosure** (or foil wrap) for the board (untested).
+5. **Active GPS antenna + external bias tee** (the LimeSDR Mini has no bias tee). The antenna's LNA raises the signal before local noise is added — the most robust fix.
+
+Results with the 30 cm SMA extension (October 27, 2026, same antenna and spot, 60 s captures):
+
+| Receiver | L1 noise level | Satellites acquired | Position fix |
+|---|---|---|---|
+| LimeSDR (USB 3.0), antenna on board | −22.6 dBFS | 0 (Oct 23) | No |
+| LimeSDR (USB 3.0), 30 cm extension | −34.5 dBFS | 0 (best ratio 1.42) | No |
+| HackRF (USB 2.0), 30 cm extension | −28.4 dBFS (≈ −28.2 direct) | **5** (PRN 16, 26, 31, 3, 4; ratios 2.5–5.5) | **Yes** — 4 ephemerides, 59 fixes in 60 s |
+
+The HackRF result confirms the extension is a proper SMA cable (not RP-SMA) with negligible loss, and that the sky view was good. Noise levels are only comparable within the same receiver.
 
 ## LimeSDR Mini v2 RF Architecture
 
@@ -323,4 +334,6 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 
 **Outdoor result (Oct 2026): 0 satellites on the LimeSDR**, because USB 3.0 streaming raises the noise floor at L1 by ~20 dB when the passive antenna is mounted directly on the board (see "USB 3.0 Self-Interference"). The HackRF with the same antenna at the same spot acquired 3 satellites, so the antenna, location and `gps_rx` are fine.
 
-**Recommended next step**: Repeat the outdoor capture with one of the interference fixes — a USB 2.0-only cable or hub, an SMA extension cable to move the antenna away from the board, or an active antenna with a bias tee. Until then, use the HackRF for GPS.
+**Follow-up (Oct 27, 2026)**: USB 2.0 is not an option (the board does not enumerate on a USB 2.0 hub). A 30 cm SMA extension cut the LimeSDR's L1 noise by 12 dB but it still acquired 0 satellites, while the HackRF through the same extension acquired 5 and produced a position fix.
+
+**Recommended next step**: Reduce the remaining ~10 dB of interference — metal sheet between the antenna (on top) and the LimeSDR + USB cable (underneath), foil/ferrites on the board and cable, a longer SMA cable, or an active antenna with a bias tee. Until then, use the HackRF for GPS.
