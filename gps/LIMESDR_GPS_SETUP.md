@@ -347,6 +347,36 @@ Acquisition takes ~25 s per window on a laptop at the defaults (±40 kHz, 40 ms)
 ### Device detected but "permission denied" (Linux)
 - Run with `sudo`, or install udev rules (see capture method 2).
 
+## Test Summary (October 2026)
+
+All outdoor tests, same location in Pittsburgh. LimeSDR settings: gateware v3.11, LNAW, LNA=30 TIA=12 PGA=19, 4.096 MS/s, DC/IQ calibration on. Noise is the rms level at 1575.42 MHz over 0.5–1.0 s of the capture. "Old `gps_rx`" is the version before commit `1da59bb` (±20 kHz search, 20 ms, threshold 1.8); "new `gps_rx`" is the current default build.
+
+**LimeSDR Mini v2** (no-antenna floor: −44.4 dBFS)
+
+| Date | Antenna / setup | USB | Noise (dBFS) | Above floor | Receiver | Acquired | Ephemeris | Position fix |
+|---|---|---|---|---|---|---|---|---|
+| Oct 23 | No antenna (reference) | 3.0 | −44.4 | — | — | — | — | — |
+| Oct 23 | Taoglas screwed onto board | 3.0 | −22.6 | +21.8 | old | 0 (best 1.40)¹ | 0 | No |
+| Oct 23 | Taoglas on board, LNAH path | 3.0 | −23.3 | +21.1 | old | 0 (best 1.35) | 0 | No |
+| Oct 27 | Taoglas, 30 cm SMA extension | 3.0 | −34.5 | +9.9 | old | 0 (best 1.42)¹ | 0 | No |
+| Oct 28 | Taoglas, extension, board wrapped in foil | 2.0 | −43.9 | +0.5 | old, ±40 kHz, 40 ms, thr 1.5, start 5 s | 5 | 1 (PRN 26) | No |
+| Oct 28 | + foil ground plane under antenna | 2.0 | −44.0 | +0.4 | old, ±40 kHz, 40 ms, thr 1.5, start 5 s | 4 | 2 (PRN 26, 31) | No |
+| Oct 28 | same capture | 2.0 | −44.0 | +0.4 | **new** | 5 | **4** | **Yes — 55 fixes** |
+| Oct 28 | same setup, fresh capture | 2.0 | −44.0 | +0.4 | **new** | 4 | **4** | **Yes — 52 fixes** |
+| Oct 28 | MAX RangeAnt + foil ground plane | 2.0 | −36.2 | +8.2 | new | 0 (best 1.23) | 0 | No |
+| Oct 28 | MAX RangeAnt, no ground plane | 2.0 | −19.7 | +24.7 | new | 0 (best 1.39) | 0 | No |
+
+¹ The Oct 23 60 s acquisition capture was taken with calibration off (I/Q imbalance 4:1); the noise figure is from a calibrated capture of the same setup. The old receiver searched only ±20 kHz, so it could not have found satellites on this LimeSDR anyway (they sit at +24.5 to +29.5 kHz; see "LimeSDR Reference Frequency Offset"). On USB 3.0 the interference was also ~20 dB too high.
+
+**HackRF Pro** (same Taoglas antenna; HackRF dBFS values are on a different scale and not comparable with the LimeSDR's)
+
+| Date | Antenna / setup | USB | Noise on / off (dBFS) | Rise | Receiver | Acquired | Ephemeris | Position fix |
+|---|---|---|---|---|---|---|---|---|
+| Oct 23 | Taoglas, direct | 2.0 | −28.2 / −30.5 | +2.3 | old | 3 (ratios 9.1, 5.0, 4.3) | — | No (3 satellites) |
+| Oct 27 | Taoglas, 30 cm SMA extension | 2.0 | −28.4 / — | — | old | 5 (ratios 2.5–5.5) | 4 | **Yes — 59 fixes** |
+
+The HackRF has not yet been tested with the new `gps_rx`.
+
 ## Current Status (October 2026)
 
 **GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of three bugs (plus the USB 3.0 interference issue below, which affects every OS):
