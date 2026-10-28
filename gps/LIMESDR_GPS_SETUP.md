@@ -35,7 +35,7 @@ Using the HackRF as a noise probe next to the LimeSDR (HackRF noise at 1575.42 M
 The noise appears only while data is streaming over USB 3.0 and is independent of LO frequency and sample rate. This matches USB 3.0 link emissions (a continuous scrambled 5 Gbps signal while transferring), not the LMS7002M RF chain. The USB 3.0 cable and the on-board FT601 can't be told apart with these tests.
 
 Fixes tried and remaining, roughly in order of cost:
-1. **USB 2.0 — does not work with this board.** In theory the FT601 falls back to 480 Mbps (enough for 4.096 MS/s), but this LimeSDR never enumerated on USB 2.0: not through a genuine USB 2.0 hub (QinHeng `1a86:8095`, 480 Mbps; board LED on, but no connect attempt at all in the kernel log), and not with the SuperSpeed port disabled in sysfs (`usbN-portM/disable`). Note: a small USB-A→C adapter may contain a USB 3.0 hub (check `cat /sys/bus/usb/devices/<dev>/speed`: `480` = USB 2.0, `5000` = USB 3.0).
+1. **USB 2.0 — works, but unreliable to get.** USB 2.0 carries 4.096 MS/s with zero loss and removes the interference. This LimeSDR did not enumerate through a genuine USB 2.0 hub (QinHeng `1a86:8095`, 480 Mbps; board LED on, no connect attempt in the kernel log), nor with the SuperSpeed port disabled in sysfs (`usbN-portM/disable`). It **did** come up at USB 2.0 directly on the laptop port after being wrapped in aluminium foil (Oct 28), presumably because the foil disturbed the SuperSpeed contacts. `limeDevice` then reports `media=USB2.0`. Note: a small USB-A→C adapter may contain a USB 3.0 hub (check `cat /sys/bus/usb/devices/<dev>/speed`: `480` = USB 2.0, `5000` = USB 3.0).
 2. **SMA extension cable — helps but not enough on its own.** A 30 cm (1 ft) extension lowered the L1 noise from −22.6 to **−34.5 dBFS (−12 dB)**, still ~10 dB above the no-antenna floor (−44.4 dBFS). The LimeSDR still acquired 0 satellites (best ratio 1.42), while the HackRF through the same extension got a full fix (see table below). Longer cables (1–3 m) should help further.
 3. **Metal sheet as shield + ground plane** (untested): antenna PCB on top of a baking tray / foil-covered board, patch facing up; LimeSDR and USB cable underneath, cable leading away. The antenna's own PCB ground plane (Taoglas specifies a 70 × 70 mm plane) only shields directly below it.
 4. **Ferrite chokes** on the USB cable and a **shielded enclosure** (or foil wrap) for the board (untested).
@@ -286,13 +286,36 @@ gcc -O3 -march=native -o gps_rx gps/gps_rx.c -lm
 
 The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4.096 MS/s.
 
-### Acquisition Parameters
+### LimeSDR Reference Frequency Offset (~16.5 ppm)
 
-| Parameter    | Value | Notes |
-|--------------|-------|-------|
-| `ACQ_MS`     | 20    | Coherent integration time (ms) |
-| `ACQ_THRESH` | 1.8   | Peak/second-peak ratio threshold |
-| `FS`         | 4.096e6 | Sample rate (Hz) |
+The LimeSDR Mini v2 tested (serial 1DBB8106DEEE92) has a reference oscillator (VCTCXO) error of about **16.5 ppm**: every satellite appears **+24.5 to +29.5 kHz** from its true Doppler (true Doppler for a stationary receiver is within ±5 kHz). The offset was constant over a 60 s capture and identical for all satellites, so it is the receiver, not the signal. The HackRF showed no such offset.
+
+The original `gps_rx` searched only ±20 kHz, so it could never find any satellite on this LimeSDR, independently of the interference problem. `ACQ_DOPP_MAX` now defaults to ±40 kHz. Because the sample clock comes from the same reference, the offset behaves like extra Doppler everywhere (carrier and code), and tracking/PVT handle it without further correction.
+
+Not done: trimming the board's VCTCXO DAC (reported as 1049 by `limeDevice --full`) or offsetting the LO in `gps_capture.cpp`. Either would bring satellites back near 0 Hz.
+
+### Acquisition and Tracking Parameters
+
+All tunables can be overridden at build time, e.g. `gcc -O3 -march=native -DACQ_MS=80 -o gps_rx gps/gps_rx.c -lm`.
+
+| Parameter      | Default | Notes |
+|----------------|---------|-------|
+| `ACQ_MS`       | 40      | Non-coherent integration (ms). Was 20; 40 is needed for the LimeSDR's weaker signals |
+| `ACQ_THRESH`   | 1.5     | Peak/second-peak ratio. Was 1.8; false detections are rejected later by the lock check or never produce ephemeris |
+| `ACQ_DOPP_MAX` | 40000   | Doppler search ±Hz. Was 20000; see reference frequency offset above |
+| `ACQ_START_S`  | 0.5     | Time of the first acquisition window (s) |
+| `ACQ_TRIES`    | 5       | While fewer than 4 satellites are found, acquisition is retried every 2 s and new PRNs are added |
+| `REFINE_MS`    | 400     | Fine Doppler search after acquisition (starts tracking within a few Hz instead of ±125 Hz) |
+| `FLL_GAIN`     | 0.05    | FLL pull-in gain per 1 ms. Was 0.25, which was too noisy for weak signals |
+| `PLL_BN`       | 15      | PLL noise bandwidth (Hz). Was 20 |
+| `LOCK_RETRIES` | 3       | Failed lock checks re-run pull-in instead of dropping the satellite |
+| `FS`           | 4.096e6 | Sample rate (Hz) |
+
+Other receiver fixes (October 28, 2026):
+- **Code Doppler compensation in acquisition**: the code peak drifts ~0.07 samples/ms at +26 kHz, which smeared long integrations. Each 1 ms correlation is now shifted back before summing.
+- **Subframe timing by majority vote**: `decode_nav` used to take the first parity-valid subframe as the timing reference. A false preamble at 846 ms (TOW 6189 vs. true ~54305) passed parity and caused every genuine subframe to be rejected (1 valid subframe instead of 9). All parity-valid subframes are now collected and the timing most of them agree on is used.
+
+Acquisition takes ~25 s per window on a laptop at the defaults (±40 kHz, 40 ms), so a weak capture needing retries takes 2–3 minutes before tracking starts.
 
 ## Troubleshooting
 
@@ -317,8 +340,9 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 - **Check I/Q balance**: Q/I rms ratio should be ~1.0. If it is ~4, DC/IQ calibration is not enabled.
 - **Check antenna path**: gateware v2.2 forces LNAH regardless of software setting. Flash v3.11 or accept weak signal.
 - **Check antenna placement**: must be outdoors, patch facing sky, SMA tight.
+- **Check the Doppler range**: satellites on this LimeSDR appear at +24.5 to +29.5 kHz (reference frequency offset). A `gps_rx` built with `ACQ_DOPP_MAX=20000` (the old default) will never find them.
 - **Try higher gains**: max out LNA=30, TIA=12, PGA=19.
-- **Try longer integration**: increase `ACQ_MS` to 40 in `gps_rx.c` and lower `ACQ_THRESH` to 1.5.
+- **Try longer integration**: build with `-DACQ_MS=80`.
 
 ### Device detected but "permission denied" (Linux)
 - Run with `sudo`, or install udev rules (see capture method 2).
@@ -336,4 +360,26 @@ The IQ file format is complex float32 (interleaved I/Q, 8 bytes per sample) at 4
 
 **Follow-up (Oct 27, 2026)**: USB 2.0 is not an option (the board does not enumerate on a USB 2.0 hub). A 30 cm SMA extension cut the LimeSDR's L1 noise by 12 dB but it still acquired 0 satellites, while the HackRF through the same extension acquired 5 and produced a position fix.
 
-**Recommended next step**: Reduce the remaining ~10 dB of interference — metal sheet between the antenna (on top) and the LimeSDR + USB cable (underneath), foil/ferrites on the board and cable, a longer SMA cable, or an active antenna with a bias tee. Until then, use the HackRF for GPS.
+**Position fix achieved (Oct 28, 2026)**: LimeSDR wrapped in aluminium foil, 30 cm SMA extension, foil sheet as ground plane under the antenna PCB, outdoors. With the foil wrap the board enumerated at **USB 2.0** directly on the laptop port, and L1 noise fell to −44.0 dBFS (the no-antenna floor). The updated `gps_rx` (default build) on a 60 s capture:
+
+| | Result |
+|---|---|
+| Satellites with ephemeris | 4 (PRN 26, 31, 3, 4), all at +24.5 to +29.2 kHz apparent Doppler |
+| Position fixes | 55 in 60 s, horizontal scatter ~10–13 m, altitude 263 m (plausible for Pittsburgh) |
+| Same capture, original `gps_rx` | 0 satellites (±20 kHz search); with the search widened, 2 satellites with ephemeris, no fix |
+
+A second, fresh 60 s capture with the same setup also gave a fix: 52 fixes from PRN 4, 26, 9 and 16 (two found only on acquisition retries), mean position ~12 m from the HackRF fix in `HACKRF_GPS_SETUP.md`.
+
+What it took, in order of discovery: gateware v3.11 (not v3.12), DC/IQ calibration, avoiding USB 3.0 interference (foil + USB 2.0), a ground plane, a wider Doppler search for the reference offset, and the acquisition/tracking/decoding fixes above. The ground plane alone raised PRN 26 from ratio 3.4 to 9.2 and PRN 31 from 1.9 to 5.2.
+
+**Remaining issues**: signals are still a few dB weaker than on the HackRF (with USB noise gone, the LimeSDR's post-LNA stages dominate the noise floor; LNA gain 30→0 changes the noise by only 2.7 dB), so only 4 satellites reach ephemeris. The USB 2.0 connection depends on how the foil sits. An active antenna with a bias tee would give margin for both.
+
+**MAX RangeAnt antenna (Oct 28, 2026) — no satellites.** Swapped in for the Taoglas patch, same foil-wrapped LimeSDR on USB 2.0, same spot:
+
+| Setup | L1 noise (rms) | Broadband floor | LO reflection spike at 0 Hz | Satellites (5 acquisition windows) |
+|---|---|---|---|---|
+| Taoglas + foil ground plane | −44.0 dBFS | — | small | 4 with ephemeris, position fix |
+| RangeAnt + foil ground plane | −36.2 dBFS | −2.3 dB | 24.0 dB (+28.7 dB above floor) | 0 (best ratio 1.23) |
+| RangeAnt, no ground plane | −19.7 dBFS | 14.5 dB (+16.8) | 41.7 dB (+17.7) | 0 (best ratio 1.39) |
+
+The large spike at 0 Hz is the LimeSDR's own LO leaking out of the RX port and reflecting back, which points to a poor impedance match at 1575 MHz. Without the ground plane, broadband noise rose ~17 dB while the board stayed on USB 2.0, so the antenna/cable is picking up far more local noise. Not determined: what band the RangeAnt is designed for, and whether it is an active antenna (the LimeSDR Mini cannot power one). Use the Taoglas patch for GPS.

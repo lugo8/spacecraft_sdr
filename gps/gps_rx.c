@@ -57,17 +57,55 @@
 #define MU            3.986005e14
 #define PI            3.14159265358979323846
 
-#define ACQ_MS        20
-#define ACQ_DOPP_MAX  20000
+/* Tunables below can be overridden at build time, e.g. -DACQ_MS=40 */
+#ifndef ACQ_MS
+#define ACQ_MS        40
+#endif
+/* +/-40 kHz covers satellite Doppler (+/-5 kHz) plus SDR reference error:
+ * the LimeSDR Mini v2 tested was ~16.5 ppm off (+26 kHz at L1) */
+#ifndef ACQ_DOPP_MAX
+#define ACQ_DOPP_MAX  40000
+#endif
 #define ACQ_DOPP_STEP 250
-#define ACQ_THRESH    1.8
+/* false detections below ~1.8 are rejected later by the lock check or
+ * never yield ephemeris, so a low threshold only costs tracking time */
+#ifndef ACQ_THRESH
+#define ACQ_THRESH    1.5
+#endif
+#ifndef ACQ_START_S
 #define ACQ_START_S   0.5
+#endif
+#ifndef ACQ_TRIES
+#define ACQ_TRIES     5            /* acquisition windows tried while < 4 sats */
+#endif
+#define ACQ_RETRY_S   2.0          /* spacing between acquisition windows */
 #define MAX_CH        12
 
+/* fine Doppler search after acquisition: REFINE_MS of 1 ms code-wiped
+ * sums, searched +/-REFINE_SPAN Hz with 10 ms coherent blocks */
+#ifndef REFINE_MS
+#define REFINE_MS     400
+#endif
+#define REFINE_SPAN   150.0
+#define REFINE_STEP   2.0
+
+#ifndef FLL_MS
 #define FLL_MS        400
-#define PLL_BN        20.0
+#endif
+#ifndef FLL_GAIN
+#define FLL_GAIN      0.05
+#endif
+#ifndef PLL_BN
+#define PLL_BN        15.0
+#endif
 #define ZETA          0.7071
 #define DLL_GAIN      0.01
+#ifndef LOCK_MS
+#define LOCK_MS       200          /* lock check window after FLL */
+#endif
+#ifndef LOCK_RETRIES
+#define LOCK_RETRIES  3            /* re-pull-in attempts before dropping */
+#endif
 
 #define TRACK_MS_MAX  300000       /* 5 minutes; for streaming, effectively unlimited */
 
@@ -273,7 +311,7 @@ static void fft(cpx *x, int n, int inv)
 }
 
 /* ------------------------- acquisition --------------------------- */
-typedef struct { int prn; double dop; int cp; double ratio; } acq_t;
+typedef struct { int prn; double dop; int cp; double ratio; long long start; } acq_t;
 
 static int cmp_acq(const void *a, const void *b)
 {
@@ -317,12 +355,19 @@ static int acquire(stream_t *s, long long start, acq_t *out)
             for (int n = 0; n < NS; n++) spec[k*NS+n] = cmul(blk[k*NS+n], car[n]);
             fft(spec + k*NS, NS, 0);
         }
+        /* code Doppler: the code peak moves -NS*dop/F_L1 samples per ms;
+         * shift each ms back so long integrations don't smear the peak */
+        double drift = NS * (double)dop / F_L1;
         for (int prn = 1; prn <= 32; prn++) {
             memset(acc, 0, sizeof(double) * NS);
             for (int k = 0; k < ACQ_MS; k++) {
                 for (int n = 0; n < NS; n++) prod[n] = cmul(spec[k*NS+n], cf[prn*NS+n]);
                 fft(prod, NS, 1);
-                for (int n = 0; n < NS; n++) acc[n] += prod[n].r*prod[n].r + prod[n].i*prod[n].i;
+                int sh = (int)lround(k * drift) % NS;
+                for (int n = 0; n < NS; n++) {
+                    int m = (n - sh + NS) % NS;
+                    acc[n] += prod[m].r*prod[m].r + prod[m].i*prod[m].i;
+                }
             }
             int pk = 0; double pv = 0;
             for (int n = 0; n < NS; n++) if (acc[n] > pv) { pv = acc[n]; pk = n; }
@@ -361,6 +406,57 @@ static int acquire(stream_t *s, long long start, acq_t *out)
     return nout;
 }
 
+/* Refine a coarse (ACQ_DOPP_STEP) Doppler estimate so tracking starts within
+ * a few Hz. Wipes code and carrier over REFINE_MS 1 ms epochs starting at the
+ * code start n0, then searches residual frequency with 10 ms coherent blocks
+ * (short enough to tolerate nav bit flips) summed non-coherently. */
+static double refine_doppler(stream_t *s, int prn, long long n0, double dop0)
+{
+    int8_t code[1023];
+    cpx y[REFINE_MS];
+    gen_ca(prn, code);
+
+    double step = CODE_RATE * (1.0 + dop0 / F_L1) / FS;
+    double dphi = 2.0 * PI * dop0 / FS;
+    double p = 0.0, phase = 0.0;
+    long long n = n0;
+    for (int k = 0; k < REFINE_MS; k++) {
+        const sample_t *x = stream_get(s, n, NS + 16);
+        if (!x) return dop0;
+        double er = cos(phase), ei = -sin(phase);
+        double rr = cos(dphi),  ri = -sin(dphi);
+        double sr = 0, si = 0;
+        int j = 0;
+        while (p < 1023.0 && j < NS + 8) {
+            double c = code[cidx(p)];
+            sr += (x[j].i * er - x[j].q * ei) * c;
+            si += (x[j].i * ei + x[j].q * er) * c;
+            double t = er * rr - ei * ri; ei = er * ri + ei * rr; er = t;
+            p += step; j++;
+        }
+        n += j;
+        p -= 1023.0;
+        phase = fmod(phase + dphi * j, 2.0 * PI);
+        y[k].r = sr; y[k].i = si;
+    }
+
+    double best = -1.0, bestf = 0.0;
+    for (double f = -REFINE_SPAN; f <= REFINE_SPAN; f += REFINE_STEP) {
+        double pw = 0;
+        for (int b = 0; b + 10 <= REFINE_MS; b += 10) {
+            double cr = 0, ci = 0;
+            for (int k = b; k < b + 10; k++) {
+                double a = -2.0 * PI * f * (k - b) * 0.001;
+                cr += y[k].r * cos(a) - y[k].i * sin(a);
+                ci += y[k].r * sin(a) + y[k].i * cos(a);
+            }
+            pw += cr * cr + ci * ci;
+        }
+        if (pw > best) { best = pw; bestf = f; }
+    }
+    return dop0 + bestf;
+}
+
 /* ------------------------- ephemeris ----------------------------- */
 typedef struct {
     int have1, have2, have3, valid;
@@ -391,6 +487,8 @@ typedef struct {
     /* status */
     int active;
     int locked;
+    double dop0;         /* starting Doppler, reused on lock retry */
+    int retries;
 
     /* navigation */
     int have_t0, e0;
@@ -417,6 +515,8 @@ static void track_init(chan_t *c, long long n0, double dop0)
     c->nep = 0;
     c->active = 1;
     c->locked = 0;
+    c->dop0 = dop0;
+    c->retries = 0;
     memset(&c->eph, 0, sizeof(eph_t));
     c->have_t0 = 0;
     c->nsf = 0;
@@ -478,7 +578,7 @@ static int track_epoch(stream_t *s, chan_t *c)
             double dot   = c->ipv * Pi + c->qpv * Pq;
             double fe = atan2(cross * (dot < 0 ? -1.0 : 1.0),
                               fabs(dot)) / (2.0 * PI * 0.001);
-            c->fcar += 0.25 * fe;
+            c->fcar += FLL_GAIN * fe;
         }
         if (i == FLL_MS - 1) c->wint = 2.0 * PI * c->fcar;
     } else {
@@ -489,20 +589,30 @@ static int track_epoch(stream_t *s, chan_t *c)
     c->ipv = Pi; c->qpv = Pq; c->have_prev = 1;
     c->nep = i + 1;
 
-    /* lock check at epoch FLL_MS + 200 */
-    if (i == FLL_MS + 199) {
+    /* lock check at epoch FLL_MS + LOCK_MS */
+    if (i == FLL_MS + LOCK_MS - 1) {
         double si = 0, sq = 0;
         for (int j = FLL_MS; j <= i; j++) {
             si += fabs(c->ip[j]);
             sq += fabs(c->qp[j]);
         }
         if (si < 2.0 * sq) {
+            if (c->retries < LOCK_RETRIES) {
+                /* restart pull-in from the starting Doppler; history so far
+                 * is discarded, the sample position carries on */
+                c->retries++;
+                c->fcar = c->dop0;
+                c->wint = 0.0;
+                c->have_prev = 0;
+                c->nep = 0;
+                return 1;
+            }
             c->active = 0;
             return -1;
         }
         c->locked = 1;
-        fprintf(stderr, "  PRN %2d: carrier locked, freq %.1f Hz\n",
-                c->prn, c->fcar);
+        fprintf(stderr, "  PRN %2d: carrier locked, freq %.1f Hz (retries %d)\n",
+                c->prn, c->fcar, c->retries);
     }
 
     return 1;
@@ -609,7 +719,13 @@ static void decode_nav(chan_t *c)
     }
     static const int pre[8] = {1,0,0,0,1,0,1,1};
     int d[301];
-    c->nsf = 0;
+
+    /* collect every parity-valid subframe first: a false preamble match can
+     * pass parity, so the timing reference is chosen by majority vote rather
+     * than taken from whichever subframe comes first */
+    int *sfb = (int *)malloc(sizeof(int) * nb);
+    double *sft = (double *)malloc(sizeof(double) * nb);
+    int nsf = 0;
     for (int b = 2; b + 300 <= nb; b++) {
         int m = 1, v = 1;
         for (int j = 0; j < 8; j++) {
@@ -621,13 +737,35 @@ static void decode_nav(chan_t *c)
         int id = (int)getu(d, 50, 3);
         long tow = (long)getu(d, 31, 17);
         if (id < 1 || id > 5) continue;
-        double tsf = tow * 6.0 - 6.0;
-        int esf = e_first + 20 * b;
-        if (!c->have_t0) { c->t0 = tsf; c->e0 = esf; c->have_t0 = 1; }
-        else if (fabs(c->t0 + (esf - c->e0) * 0.001 - tsf) > 0.0005) continue;
-        c->nsf++;
-        if (id <= 3) parse_subframe(d, id, &c->eph);
+        sfb[nsf] = b;
+        sft[nsf] = tow * 6.0 - 6.0;
+        nsf++;
     }
+
+    int best = -1, bestn = 0;
+    for (int a = 0; a < nsf; a++) {
+        int n = 0;
+        for (int j = 0; j < nsf; j++)
+            if (fabs(sft[a] + 20 * (sfb[j] - sfb[a]) * 0.001 - sft[j]) <= 0.0005) n++;
+        if (n > bestn) { bestn = n; best = a; }
+    }
+
+    c->nsf = 0;
+    if (best >= 0) {
+        c->t0 = sft[best];
+        c->e0 = e_first + 20 * sfb[best];
+        c->have_t0 = 1;
+        for (int j = 0; j < nsf; j++) {
+            if (fabs(c->t0 + (e_first + 20 * sfb[j] - c->e0) * 0.001 - sft[j]) > 0.0005)
+                continue;
+            int b = sfb[j];
+            parity_subframe(bits + b, bits[b-2], bits[b-1], d);
+            c->nsf++;
+            int id = (int)getu(d, 50, 3);
+            if (id <= 3) parse_subframe(d, id, &c->eph);
+        }
+    }
+    free(sfb); free(sft);
     free(bits);
 }
 
@@ -909,6 +1047,27 @@ int main(int argc, char **argv)
     long long start = (long long)(ACQ_START_S * FS);
     acq_t acq[64];
     int nacq = acquire(&s, start, acq);
+    for (int i = 0; i < nacq; i++) acq[i].start = start;
+
+    /* weak satellites fade in and out of a single snapshot: retry later
+     * windows and add any new PRNs, each tracked from its own start */
+    for (int t = 1; t < ACQ_TRIES && nacq < 4; t++) {
+        long long st = start + (long long)(t * ACQ_RETRY_S * FS);
+        if (!stream_fill(&s, st + (long long)ACQ_MS * NS)) break;
+        fprintf(stderr, "Only %d satellites, retrying acquisition at %.1f s\n",
+                nacq, st / FS);
+        acq_t more[64];
+        int nm = acquire(&s, st, more);
+        for (int j = 0; j < nm && nacq < MAX_CH; j++) {
+            int dup = 0;
+            for (int i = 0; i < nacq; i++) if (acq[i].prn == more[j].prn) dup = 1;
+            if (dup) continue;
+            acq[nacq] = more[j];
+            acq[nacq].start = st;
+            nacq++;
+        }
+    }
+
     fprintf(stderr, "Acquired %d satellites:\n", nacq);
     for (int i = 0; i < nacq; i++)
         fprintf(stderr, "  PRN %2d  ratio %5.1f  doppler %7.0f Hz  codephase %4d\n",
@@ -923,8 +1082,11 @@ int main(int argc, char **argv)
     chan_t ch[MAX_CH];
     memset(ch, 0, sizeof(ch));
     for (int i = 0; i < nacq && nch < MAX_CH; i++) {
+        double dop = refine_doppler(&s, acq[i].prn, acq[i].start + acq[i].cp, acq[i].dop);
+        fprintf(stderr, "  PRN %2d: Doppler refined %7.0f -> %8.1f Hz\n",
+                acq[i].prn, acq[i].dop, dop);
         ch[nch].prn = acq[i].prn;
-        track_init(&ch[nch], start + acq[i].cp, acq[i].dop);
+        track_init(&ch[nch], acq[i].start + acq[i].cp, dop);
         nch++;
     }
 
