@@ -22,7 +22,7 @@ int main(int argc, char** argv)
     double centerFreq = 1575.42e6;
     double sampleRate = 4.096e6;
     int durationSec = 30;
-    const char* outputFile = "/tmp/gps_capture.bin";
+    const char* outputFile = "gps_capture.bin";
 
     if (argc > 1) outputFile = argv[1];
     if (argc > 2) durationSec = std::atoi(argv[2]);

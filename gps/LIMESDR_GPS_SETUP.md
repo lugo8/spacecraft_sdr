@@ -347,7 +347,7 @@ Acquisition takes ~25 s per window on a laptop at the defaults (±40 kHz, 40 ms)
 ### Device detected but "permission denied" (Linux)
 - Run with `sudo`, or install udev rules (see capture method 2).
 
-## Test Summary (October 2026)
+## Test Summary (October–November 2026)
 
 All outdoor tests, same location in Pittsburgh. LimeSDR settings: gateware v3.11, LNAW, LNA=30 TIA=12 PGA=19, 4.096 MS/s, DC/IQ calibration on. Noise is the rms level at 1575.42 MHz over 0.5–1.0 s of the capture. "Old `gps_rx`" is the version before commit `1da59bb` (±20 kHz search, 20 ms, threshold 1.8); "new `gps_rx`" is the current default build.
 
@@ -366,6 +366,15 @@ All outdoor tests, same location in Pittsburgh. LimeSDR settings: gateware v3.11
 | Oct 28 | MAX RangeAnt + foil ground plane | 2.0 | −36.2 | +8.2 | new | 0 (best 1.23) | 0 | No |
 | Oct 28 | MAX RangeAnt, no ground plane | 2.0 | −19.7 | +24.7 | new | 0 (best 1.39) | 0 | No |
 
+**Raspberry Pi 4 Model B** (USB 2.0, Debian Trixie, LimeSuiteNG; same LimeSDR Mini v2, same Taoglas antenna)
+
+| Date | Antenna / setup | USB | Noise (dBFS) | Above floor | Receiver | Acquired | Ephemeris | Position fix |
+|---|---|---|---|---|---|---|---|---|
+| Nov 10 | Taoglas, extension, no foil | 2.0 | −41.5 | +2.9 | new | 5 (all lost carrier lock) | 0 | No |
+| Nov 10 | Taoglas, extension, board wrapped in foil | 2.0 | −42.2 | +2.2 | new | 4 (PRN 9 ratio 5.9, 4 ratio 3.9, 27 ratio 3.0, 16 ratio 2.1) | 0 | No |
+
+The Pi's USB 2.0 bus (VIA Labs hub, Bus 001) streams at full rate with zero overflows (~16 MB/s at 4.096 MS/s). Without foil, 5 satellites were acquired but all lost carrier lock — the noise was too high for stable tracking. With foil wrapping, 4 satellites achieved carrier lock (PRN 16 needed 3 retries) and tracked for the full 60 s, but all reported 0 valid subframes — the SNR was too marginal for nav data decoding. The noise floor is ~2 dB worse than the laptop's successful run (−44.0 dBFS), likely from the Pi's own USB/board emissions or lack of a foil ground plane under the antenna. A longer capture (90+ s) or adding the ground plane may close the gap.
+
 ¹ The Oct 23 60 s acquisition capture was taken with calibration off (I/Q imbalance 4:1); the noise figure is from a calibrated capture of the same setup. The old receiver searched only ±20 kHz, so it could not have found satellites on this LimeSDR anyway (they sit at +24.5 to +29.5 kHz; see "LimeSDR Reference Frequency Offset"). On USB 3.0 the interference was also ~20 dB too high.
 
 **HackRF Pro** (same Taoglas antenna; HackRF dBFS values are on a different scale and not comparable with the LimeSDR's)
@@ -377,7 +386,7 @@ All outdoor tests, same location in Pittsburgh. LimeSDR settings: gateware v3.11
 
 The HackRF has not yet been tested with the new `gps_rx`.
 
-## Current Status (October 2026)
+## Current Status (November 2026)
 
 **GPS reception with LimeSDR Mini v2 on Windows is currently blocked** by the intersection of three bugs (plus the USB 3.0 interference issue below, which affects every OS):
 1. Gateware v2.2 RF switch bug routes GPS to wrong antenna (LNAH)
@@ -403,6 +412,8 @@ A second, fresh 60 s capture with the same setup also gave a fix: 52 fixes from 
 What it took, in order of discovery: gateware v3.11 (not v3.12), DC/IQ calibration, avoiding USB 3.0 interference (foil + USB 2.0), a ground plane, a wider Doppler search for the reference offset, and the acquisition/tracking/decoding fixes above. The ground plane alone raised PRN 26 from ratio 3.4 to 9.2 and PRN 31 from 1.9 to 5.2.
 
 **Remaining issues**: signals are still a few dB weaker than on the HackRF (with USB noise gone, the LimeSDR's post-LNA stages dominate the noise floor; LNA gain 30→0 changes the noise by only 2.7 dB), so only 4 satellites reach ephemeris. The USB 2.0 connection depends on how the foil sits. An active antenna with a bias tee would give margin for both.
+
+**Raspberry Pi 4 ground test (Nov 10, 2026) — no position fix.** Same LimeSDR Mini v2 + Taoglas antenna, connected to a Raspberry Pi 4 Model B (Debian Trixie, LimeSuiteNG) over USB 2.0 (480 Mbps, Bus 001 via VIA Labs hub). Streaming runs at full rate with zero overflows. Without foil, 5 satellites acquired but all lost carrier lock. With foil wrapping, 4 satellites locked and tracked for 60 s but decoded 0 valid subframes — the noise floor on the Pi (−42.2 dBFS) is ~2 dB worse than the laptop's successful run (−44.0 dBFS). No foil ground plane was used under the antenna. Next steps: add the ground plane (which raised individual satellite ratios 2–3x on the laptop) and/or extend the capture to 90–120 s.
 
 **MAX RangeAnt antenna (Oct 28, 2026) — no satellites.** Swapped in for the Taoglas patch, same foil-wrapped LimeSDR on USB 2.0, same spot:
 
