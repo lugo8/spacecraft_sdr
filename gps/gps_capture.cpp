@@ -62,8 +62,8 @@ int main(int argc, char** argv)
     config.channel[0].rx.enabled = true;
     config.channel[0].rx.centerFrequency = centerFreq;
     config.channel[0].rx.sampleRate = sampleRate;
-    config.channel[0].rx.oversample = 2;
-    config.channel[0].rx.lpf = 5e6;
+    config.channel[0].rx.oversample = 4;
+    config.channel[0].rx.lpf = 2.5e6;
     config.channel[0].rx.path = lnawIndex;
     // Without DC/IQ calibration LNAW shows ~4:1 Q/I amplitude imbalance
     config.channel[0].rx.calibrate = CalibrationFlag::DCIQ;
