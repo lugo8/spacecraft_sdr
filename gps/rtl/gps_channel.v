@@ -10,7 +10,7 @@ module gps_channel (
     input  wire [31:0] carrier_freq,
     input  wire [31:0] code_freq,
 
-    // Code phase preset (for acquisition)
+    // Code phase preset (loaded from acquisition result)
     input  wire        phase_wen,
     input  wire [9:0]  phase_in,
 
@@ -118,6 +118,12 @@ module gps_channel (
             epoch_count <= 16'd0;
         end else begin
             epoch_flag <= 1'b0;
+
+            if (phase_wen) begin
+                acc_ie <= 0; acc_qe <= 0;
+                acc_ip <= 0; acc_qp <= 0;
+                acc_il <= 0; acc_ql <= 0;
+            end
 
             if (sample_valid & ~busy) begin
                 car_phase  <= car_phase + carrier_freq;
