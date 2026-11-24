@@ -56,6 +56,28 @@ Lattice ECP5 LFE5U-45F-8MG285C on the LimeSDR Mini v2.
 | DSP (MULT18X18D) | 72 |
 | PLLs | 4 |
 
+## Resource usage (synthesis)
+
+Standalone GPS correlator (Yosys `synth_ecp5`, split flow with `opt -fast`):
+
+| Module | LUT4 | FF | DP16KD | MULT18 |
+|--------|-----:|---:|-------:|-------:|
+| fftmain (4096-pt FFT) | 1,872 | 4,974 | 17 | 24 |
+| gps_correlator (full, with FFT acq) | 12,797 | 11,447 | 26 | 28 |
+
+Full SoC build (LiteX + GPS, `--with-gps --no-ppsdo`):
+
+| Resource | Used | Available | % |
+|----------|-----:|----------:|--:|
+| LUT4 | 21,647 | 44,340 | 49% |
+| TRELLIS_FF | 16,592 | 44,340 | 37% |
+| DP16KD | 66 | 108 | 61% |
+| MULT18X18D | 4 | 72 | 6% |
+
+The FFT's 24 multipliers are implemented in LUTs (via `longbimpy` shift-add)
+rather than DSP slices in the full SoC build. The 4 MULT18 are from the
+tracking loop's shared 32×32 multiplier. Functionally equivalent.
+
 ## Architecture
 
 The software receiver (`gps_rx.c`) processes raw I/Q samples entirely on the CPU.
