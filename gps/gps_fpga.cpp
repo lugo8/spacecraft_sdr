@@ -54,9 +54,17 @@
 #define MAX_PRN       32
 
 /* Acquisition: Doppler search range and step (Hz) */
-#define ACQ_DOPP_MAX  10000
+#define ACQ_DOPP_MAX  40000
 #define ACQ_DOPP_STEP 500
 #define ACQ_THRESH    500       /* minimum peak power to declare detection */
+
+/* Two-tier acquisition: coarse sweep finds candidates, fine sweep refines */
+#define ACQ_COARSE_EPOCHS  20
+#define ACQ_COARSE_STEP    1000
+#define ACQ_COARSE_THRESH  100   /* ~linear with epochs: 500 * 20/40 = 250, lowered for weak signals */
+#define ACQ_FINE_EPOCHS    40
+#define ACQ_FINE_STEP      250
+#define ACQ_FINE_RANGE     500   /* ±Hz around coarse hit */
 
 /* Tracking */
 #define LOCK_WINDOW   200       /* epochs to accumulate for lock check */
@@ -79,11 +87,15 @@
  * PLL: 2nd order, BN=15 Hz, zeta=0.707 → wn ≈ 28.3 rad/s
  *   proportional: 2*zeta*wn / (2*pi) * T * 2^16 ≈ 418
  *   integral:     wn^2 / (2*pi) * T^2 * 2^16 ≈ 8
+ * FLL: cross/dot discriminator, applied during first FLL_EPOCHS epochs
+ *   gain = 0.05 * 2^16 / Fs ≈ 800 (conservative pull-in)
  * DLL: 1st order, cod_gain = 84000
  */
 #define DEFAULT_CAR_GAIN_P  420
 #define DEFAULT_CAR_GAIN_I  8
 #define DEFAULT_COD_GAIN    84000
+#define DEFAULT_FLL_GAIN    800
+#define DEFAULT_FLL_EPOCHS  400
 
 /* ======================== LimeSDR Device Layer ======================== */
 
@@ -232,6 +244,11 @@ static void device_close(void)
 #define REG_CAR_GAIN_P 0
 #define REG_CAR_GAIN_I 1
 #define REG_COD_GAIN   2
+#define REG_FLL_GAIN   3
+
+/* Channel 13: FLL/aiding config */
+#define CH_FLL_CFG    13
+#define REG_FLL_EPOCHS 0
 
 /* Channel 15: global / acquisition */
 #define CH_GLOBAL     15
@@ -295,6 +312,8 @@ typedef struct {
     int     have_t0;
     double  t0;              /* GPS time at bit_ref epoch */
     int     bit_ref;         /* bit index where t0 was established */
+    uint32_t epoch_start;    /* global epoch counter when tracking started */
+    uint32_t epoch_at_t0;    /* global epoch counter at the t0 reference point */
 
     /* ephemeris */
     eph_t   eph;
@@ -336,10 +355,12 @@ typedef struct {
     uint32_t power;
 } acq_result_t;
 
-static int acquire_prn(int prn, int32_t doppler_nco, acq_result_t *result)
+static int acquire_prn(int prn, int32_t doppler_nco, int num_epochs,
+                       acq_result_t *result)
 {
     /* Configure acquisition engine */
-    gps_write(CH_GLOBAL, REG_ACQ_CFG, (uint32_t)prn << 16);
+    gps_write(CH_GLOBAL, REG_ACQ_CFG,
+              ((uint32_t)prn << 16) | (num_epochs & 0x3F));
     gps_write(CH_GLOBAL, REG_ACQ_CAR, (uint32_t)doppler_nco);
 
     /* Start */
@@ -347,7 +368,7 @@ static int acquire_prn(int prn, int32_t doppler_nco, acq_result_t *result)
 
     /* Poll for completion */
     for (int i = 0; i < 200; i++) {
-        usleep(5000);
+        usleep(20000);
         uint32_t status = gps_read(CH_GLOBAL, REG_ACQ_CTRL);
         if (status & 0x80000000u) {  /* done bit */
             result->prn = prn;
@@ -362,17 +383,61 @@ static int acquire_prn(int prn, int32_t doppler_nco, acq_result_t *result)
 
 static int acquire_all(acq_result_t results[], int max_results)
 {
-    int n = 0;
-    for (int prn = 1; prn <= MAX_PRN && n < max_results; prn++) {
+    typedef struct { int prn; int32_t doppler_nco; uint32_t power; } coarse_hit_t;
+    coarse_hit_t coarse_hits[MAX_PRN];
+    int nhits = 0, n = 0;
+
+    /* Tier 1: coarse sweep — all PRNs, wide step, few epochs */
+    int coarse_bins = 2 * ACQ_DOPP_MAX / ACQ_COARSE_STEP + 1;
+    fprintf(stderr, "  Tier 1: coarse (%d epochs, %d Hz step, %d bins/PRN)\n",
+            ACQ_COARSE_EPOCHS, ACQ_COARSE_STEP, coarse_bins);
+
+    for (int prn = 1; prn <= MAX_PRN; prn++) {
+        uint32_t best_power = 0;
+        int32_t best_nco = 0;
+
+        fprintf(stderr, "    PRN %2d: ", prn);
+
+        for (int d = -ACQ_DOPP_MAX; d <= ACQ_DOPP_MAX; d += ACQ_COARSE_STEP) {
+            int32_t nco = HZ_TO_NCO(d);
+            acq_result_t r;
+            if (acquire_prn(prn, nco, ACQ_COARSE_EPOCHS, &r)
+                && r.power > best_power) {
+                best_power = r.power;
+                best_nco = nco;
+            }
+        }
+
+        if (best_power > ACQ_COARSE_THRESH) {
+            fprintf(stderr, "HIT  power=%u  doppler=%.0f Hz\n",
+                    best_power, NCO_TO_HZ(best_nco));
+            coarse_hits[nhits].prn = prn;
+            coarse_hits[nhits].doppler_nco = best_nco;
+            coarse_hits[nhits].power = best_power;
+            nhits++;
+        } else {
+            fprintf(stderr, "---  (peak=%u)\n", best_power);
+        }
+    }
+
+    fprintf(stderr, "  Tier 1 done: %d candidate(s)\n\n", nhits);
+
+    /* Tier 2: fine sweep — detected PRNs only, narrow range, full epochs */
+    int fine_bins = 2 * ACQ_FINE_RANGE / ACQ_FINE_STEP + 1;
+    fprintf(stderr, "  Tier 2: fine (%d epochs, %d Hz step, +/-%d Hz, %d bins/PRN)\n",
+            ACQ_FINE_EPOCHS, ACQ_FINE_STEP, ACQ_FINE_RANGE, fine_bins);
+
+    for (int i = 0; i < nhits && n < max_results; i++) {
         uint32_t best_power = 0;
         acq_result_t best = {};
 
-        fprintf(stderr, "  Searching PRN %2d: ", prn);
+        fprintf(stderr, "    PRN %2d: ", coarse_hits[i].prn);
 
-        for (int d = -ACQ_DOPP_MAX; d <= ACQ_DOPP_MAX; d += ACQ_DOPP_STEP) {
-            int32_t nco = HZ_TO_NCO(d);
+        for (int d = -ACQ_FINE_RANGE; d <= ACQ_FINE_RANGE; d += ACQ_FINE_STEP) {
+            int32_t nco = coarse_hits[i].doppler_nco + HZ_TO_NCO(d);
             acq_result_t r;
-            if (acquire_prn(prn, nco, &r) && r.power > best_power) {
+            if (acquire_prn(coarse_hits[i].prn, nco, ACQ_FINE_EPOCHS, &r)
+                && r.power > best_power) {
                 best_power = r.power;
                 best = r;
             }
@@ -383,9 +448,10 @@ static int acquire_all(acq_result_t results[], int max_results)
                     best_power, NCO_TO_HZ(best.doppler_nco), best.code_phase);
             results[n++] = best;
         } else {
-            fprintf(stderr, "---  (peak=%u)\n", best_power);
+            fprintf(stderr, "LOST  (fine peak=%u)\n", best_power);
         }
     }
+
     return n;
 }
 
@@ -398,7 +464,7 @@ static int acquire_assisted(int prn, int32_t last_nco, acq_result_t *result)
     for (int d = -REACQ_DOPP_MAX; d <= REACQ_DOPP_MAX; d += REACQ_DOPP_STEP) {
         int32_t nco = last_nco + HZ_TO_NCO(d);
         acq_result_t r;
-        if (acquire_prn(prn, nco, &r) && r.power > best_power) {
+        if (acquire_prn(prn, nco, ACQ_FINE_EPOCHS, &r) && r.power > best_power) {
             best_power = r.power;
             best = r;
         }
@@ -413,11 +479,14 @@ static int acquire_assisted(int prn, int32_t last_nco, acq_result_t *result)
 
 /* ======================== Tracking Management ======================== */
 
-static void set_loop_gains(int32_t car_p, int32_t car_i, int32_t cod)
+static void set_loop_gains(int32_t car_p, int32_t car_i, int32_t cod,
+                           int32_t fll, int32_t fll_ep)
 {
     gps_write(CH_GAIN, REG_CAR_GAIN_P, (uint32_t)car_p);
     gps_write(CH_GAIN, REG_CAR_GAIN_I, (uint32_t)car_i);
     gps_write(CH_GAIN, REG_COD_GAIN, (uint32_t)cod);
+    gps_write(CH_GAIN, REG_FLL_GAIN, (uint32_t)fll);
+    gps_write(CH_FLL_CFG, REG_FLL_EPOCHS, (uint32_t)fll_ep);
 }
 
 static void start_tracking(int ch, const acq_result_t *acq)
@@ -426,6 +495,7 @@ static void start_tracking(int ch, const acq_result_t *acq)
     memset(c, 0, sizeof(*c));
     c->prn = acq->prn;
     c->active = 1;
+    c->epoch_start = gps_read(CH_GLOBAL, REG_EPOCH_CNT);
 
     /* Set channel: PRN, carrier freq, code freq, code phase */
     uint32_t ctrl = ((uint32_t)(acq->prn & 0x1F)) | (1 << 5);  /* enable, no track yet */
@@ -473,6 +543,7 @@ static void attempt_reacq(int ch)
         int saved_have_t0 = c->have_t0;
         double saved_t0 = c->t0;
         int saved_bit_ref = c->bit_ref;
+        uint32_t saved_epoch_at_t0 = c->epoch_at_t0;
 
         start_tracking(ch, &r);
 
@@ -483,6 +554,7 @@ static void attempt_reacq(int ch)
         c->have_t0 = saved_have_t0;
         c->t0 = saved_t0;
         c->bit_ref = saved_bit_ref;
+        c->epoch_at_t0 = saved_epoch_at_t0;
         c->was_locked = 1;
     } else {
         fprintf(stderr, "  Ch %2d: PRN %2d assisted reacq failed, dropping\n",
@@ -642,6 +714,7 @@ static void try_decode_nav(chan_t *c)
         if (!c->have_t0) {
             c->t0 = tow * 6.0 - 6.0;
             c->bit_ref = b;
+            c->epoch_at_t0 = c->epoch_start + (uint32_t)(b * 20);
             c->have_t0 = 1;
         }
 
@@ -791,9 +864,12 @@ static int try_pvt(void)
     double sp[MAX_CH][3], rho[MAX_CH];
     double ttx[MAX_CH], tmax = 0;
 
+    /* Read global epoch counter once — consistent across all channels */
+    uint32_t epoch_now = gps_read(CH_GLOBAL, REG_EPOCH_CNT);
+
     for (int i = 0; i < nuse; i++) {
         chan_t *c = &channels[idx[i]];
-        ttx[i] = c->t0 + (c->bit_count - c->bit_ref) * 0.02;
+        ttx[i] = c->t0 + (epoch_now - c->epoch_at_t0) * 0.001;
         if (ttx[i] > tmax) tmax = ttx[i];
     }
 
@@ -858,9 +934,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "GPS correlator enabled.\n");
 
     /* Set loop filter gains */
-    set_loop_gains(DEFAULT_CAR_GAIN_P, DEFAULT_CAR_GAIN_I, DEFAULT_COD_GAIN);
-    fprintf(stderr, "Loop gains: car_p=%d car_i=%d cod=%d\n",
-            DEFAULT_CAR_GAIN_P, DEFAULT_CAR_GAIN_I, DEFAULT_COD_GAIN);
+    set_loop_gains(DEFAULT_CAR_GAIN_P, DEFAULT_CAR_GAIN_I, DEFAULT_COD_GAIN,
+                   DEFAULT_FLL_GAIN, DEFAULT_FLL_EPOCHS);
+    fprintf(stderr, "Loop gains: car_p=%d car_i=%d cod=%d fll=%d fll_epochs=%d\n",
+            DEFAULT_CAR_GAIN_P, DEFAULT_CAR_GAIN_I, DEFAULT_COD_GAIN,
+            DEFAULT_FLL_GAIN, DEFAULT_FLL_EPOCHS);
 
     /* ---- Phase 1: Acquisition ---- */
     fprintf(stderr, "\n=== Acquisition ===\n");
@@ -986,17 +1064,37 @@ int main(int argc, char **argv)
                 acq_result_t r;
                 uint32_t best_power = 0;
                 acq_result_t best = {};
-                for (int d = -ACQ_DOPP_MAX; d <= ACQ_DOPP_MAX; d += ACQ_DOPP_STEP) {
+                for (int d = -ACQ_DOPP_MAX; d <= ACQ_DOPP_MAX;
+                     d += ACQ_COARSE_STEP) {
                     int32_t nco = HZ_TO_NCO(d);
-                    if (acquire_prn(prn, nco, &r) && r.power > best_power) {
+                    if (acquire_prn(prn, nco, ACQ_COARSE_EPOCHS, &r)
+                        && r.power > best_power) {
                         best_power = r.power;
                         best = r;
                     }
                 }
-                if (best_power > ACQ_THRESH) {
-                    fprintf(stderr, "  Cold reacq: PRN %2d found (power=%u)\n",
-                            prn, best_power);
-                    start_tracking(free_ch, &best);
+                if (best_power > ACQ_COARSE_THRESH) {
+                    /* Refine with fine sweep */
+                    uint32_t fine_power = 0;
+                    acq_result_t fine = {};
+                    for (int df = -ACQ_FINE_RANGE; df <= ACQ_FINE_RANGE;
+                         df += ACQ_FINE_STEP) {
+                        int32_t fnco = best.doppler_nco + HZ_TO_NCO(df);
+                        acq_result_t fr;
+                        if (acquire_prn(prn, fnco, ACQ_FINE_EPOCHS, &fr)
+                            && fr.power > fine_power) {
+                            fine_power = fr.power;
+                            fine = fr;
+                        }
+                    }
+                    if (fine_power > ACQ_THRESH) {
+                        fprintf(stderr, "  Cold reacq: PRN %2d found (power=%u)\n",
+                                prn, fine_power);
+                        start_tracking(free_ch, &fine);
+                    } else {
+                        fprintf(stderr, "  Cold reacq: PRN %2d coarse hit but fine failed, re-queuing\n", prn);
+                        reacq_enqueue(prn);
+                    }
                 } else {
                     fprintf(stderr, "  Cold reacq: PRN %2d not found, re-queuing\n", prn);
                     reacq_enqueue(prn);

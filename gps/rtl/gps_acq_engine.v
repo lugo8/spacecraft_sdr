@@ -1,18 +1,25 @@
-// GPS matched-filter acquisition engine
+// GPS matched-filter acquisition engine with multi-epoch non-coherent accumulation
 //
-// Captures one epoch of carrier-wiped I/Q into block RAM, then correlates
-// against all 1023 code phases using LANES parallel banks per pass.
-// Reports the best code phase and its |I|+|Q| magnitude.
+// For each Doppler/PRN trial:
+//   1. Generate C/A code for the PRN (1023 chips → code ROM)
+//   2. Repeat for num_epochs epochs:
+//      a. Capture one epoch (4096 samples) of carrier-wiped I/Q into block RAM
+//      b. Correlate all 1023 code phases using LANES parallel banks per batch
+//      c. Non-coherently accumulate |I|+|Q| per phase into power RAM
+//   3. Scan power RAM for the best code phase
 //
-// Timing (LANES=20):
-//   Code generation:   1023 cycles
-//   Capture:           4096 sample_valid events (1 ms at 4.096 MS/s)
-//   Processing:        ceil(1023/LANES) × (SR_LEN + 4096) cycles
-//   Total processing:  ~270K cycles → 66 ms at 4.096 MHz, 3.5 ms at 77.5 MHz
+// Non-coherent accumulation avoids nav-bit-flip sensitivity beyond ~10 ms
+// while providing ~10*log10(num_epochs) dB processing gain over single-epoch.
+//
+// Timing (LANES=20, num_epochs=20):
+//   Code generation:   1023 cycles (once)
+//   Per epoch:         4096 (capture) + 52×(1042+4096) (correlate) ≈ 271K cycles
+//   20 epochs:         ~5.4M cycles → 1.3s at 4.096 MHz
+//   Peak scan:         1023 cycles
 //
 // Resources (LANES=20):
 //   ~1050 FFs (shift register) + ~1000 FFs (accumulators) + ~1500 LUTs
-//   ~6 EBR (epoch buffer)
+//   ~6 EBR (epoch buffer) + 2 EBR (power accumulator 1024×32)
 
 module gps_acq_engine #(
     parameter LANES = 20
@@ -28,6 +35,7 @@ module gps_acq_engine #(
     input  wire        abort,
     input  wire [4:0]  prn,
     input  wire [31:0] carrier_freq,
+    input  wire [5:0]  num_epochs,     // 1-63, non-coherent accumulation count
 
     output wire        done,
     output wire        active,
@@ -41,19 +49,22 @@ module gps_acq_engine #(
     localparam NUM_BATCHES   = (CODE_LEN + LANES - 1) / LANES;
     localparam CODE_FREQ     = 32'h3FF00000;
 
-    localparam S_IDLE      = 3'd0,
-               S_GEN_CODE  = 3'd1,
-               S_CAPTURE   = 3'd2,
-               S_LOAD_SR   = 3'd3,
-               S_CORRELATE = 3'd4,
-               S_PEAK      = 3'd5,
-               S_DONE      = 3'd6;
+    localparam S_IDLE      = 4'd0,
+               S_GEN_CODE  = 4'd1,
+               S_CLR_PWR   = 4'd2,
+               S_CAPTURE   = 4'd3,
+               S_LOAD_SR   = 4'd4,
+               S_CORRELATE = 4'd5,
+               S_PEAK_ACC  = 4'd6,
+               S_NEXT_EPOCH = 4'd7,
+               S_FIND_BEST = 4'd8,
+               S_DONE      = 4'd9;
 
-    reg [2:0] state;
+    reg [3:0] state;
     assign done   = (state == S_DONE);
     assign active = (state != S_IDLE) & (state != S_DONE);
 
-    // ---- Carrier NCO (capture phase) ----
+    // ---- Carrier NCO (persists across epochs) ----
     reg [31:0] car_phase;
     wire cos_neg = car_phase[31] ^ car_phase[30];
     wire sin_neg = car_phase[31];
@@ -84,7 +95,7 @@ module gps_acq_engine #(
         .busy      (ca_busy)
     );
 
-    // Code ROM (register array, 1023 × 1 bit)
+    // Code ROM (register array, 1023 x 1 bit)
     reg code_orig [0:CODE_LEN-1];
     reg [9:0] gen_ptr;
 
@@ -95,6 +106,19 @@ module gps_acq_engine #(
 
     always @(posedge clk)
         buf_rdata <= epoch_buf[buf_raddr];
+
+    // ---- Power accumulator RAM (1024 x 32-bit, inferred block RAM) ----
+    reg [31:0] pwr_ram [0:1023];
+    reg [9:0]  pwr_waddr, pwr_raddr;
+    reg [31:0] pwr_wdata;
+    reg        pwr_we;
+    reg [31:0] pwr_rdata;
+
+    always @(posedge clk) begin
+        pwr_rdata <= pwr_ram[pwr_raddr];
+        if (pwr_we)
+            pwr_ram[pwr_waddr] <= pwr_wdata;
+    end
 
     // ---- Code shift register ----
     reg [SR_LEN-1:0] code_sr;
@@ -119,12 +143,22 @@ module gps_acq_engine #(
     reg [LANES-1:0] code_bits_d1;
     reg              corr_valid;
 
-    // Peak scan
+    // Peak scan within a batch
     reg [4:0] peak_idx;
+    reg [1:0] peak_pipe;  // pipeline stages for power RAM read latency
+
+    // Epoch counter
+    reg [5:0] epoch_cnt;
+
+    // Find-best scan
+    reg [9:0]  scan_addr;
+    reg [1:0]  scan_pipe;
 
     // ---- Main FSM ----
     integer j;
     always @(posedge clk) begin
+        pwr_we <= 1'b0;
+
         if (rst) begin
             state     <= S_IDLE;
             car_phase <= 32'd0;
@@ -136,6 +170,8 @@ module gps_acq_engine #(
             best_phase <= 10'd0;
             best_power <= 32'd0;
             corr_valid <= 1'b0;
+            epoch_cnt  <= 6'd0;
+            pwr_we     <= 1'b0;
         end else if (abort && state != S_IDLE) begin
             state <= S_IDLE;
         end else begin
@@ -146,9 +182,10 @@ module gps_acq_engine #(
                 ca_chip_en <= 1'b0;
                 corr_valid <= 1'b0;
                 if (start) begin
-                    gen_ptr <= 10'd0;
+                    gen_ptr   <= 10'd0;
                     ca_chip_en <= 1'b0;
-                    state <= S_GEN_CODE;
+                    epoch_cnt <= 6'd0;
+                    state     <= S_GEN_CODE;
                 end
             end
 
@@ -159,9 +196,22 @@ module gps_acq_engine #(
                 gen_ptr <= gen_ptr + 10'd1;
                 if (gen_ptr == CODE_LEN - 1) begin
                     ca_chip_en <= 1'b0;
-                    car_phase  <= 32'd0;
-                    buf_waddr  <= 12'd0;
-                    state      <= S_CAPTURE;
+                    pwr_waddr  <= 10'd0;
+                    state      <= S_CLR_PWR;
+                end
+            end
+
+            // ---------------------------------------------------
+            // Clear the power accumulator RAM (1024 entries)
+            S_CLR_PWR: begin
+                pwr_we    <= 1'b1;
+                pwr_wdata <= 32'd0;
+                pwr_waddr <= pwr_waddr + 10'd1;
+                if (pwr_waddr == 10'd1023) begin
+                    pwr_we    <= 1'b0;
+                    car_phase <= 32'd0;
+                    buf_waddr <= 12'd0;
+                    state     <= S_CAPTURE;
                 end
             end
 
@@ -171,13 +221,11 @@ module gps_acq_engine #(
                     epoch_buf[buf_waddr] <= {q_mix[13:2], i_mix[13:2]};
                     car_phase <= car_phase + carrier_freq;
                     if (buf_waddr == EPOCH_SAMPLES - 1) begin
-                        batch_idx  <= 6'd0;
-                        batch_base <= 10'd0;
-                        best_phase <= 10'd0;
-                        best_power <= 32'd0;
-                        load_ptr   <= 11'd0;
-                        load_code_idx <= 10'd0;
-                        state      <= S_LOAD_SR;
+                        batch_idx      <= 6'd0;
+                        batch_base     <= 10'd0;
+                        load_ptr       <= 11'd0;
+                        load_code_idx  <= 10'd0;
+                        state          <= S_LOAD_SR;
                     end
                     buf_waddr <= buf_waddr + 12'd1;
                 end
@@ -185,8 +233,6 @@ module gps_acq_engine #(
 
             // ---------------------------------------------------
             S_LOAD_SR: begin
-                // Shift in code bits from MSB side: after SR_LEN cycles,
-                // code_sr[k] = code_orig[(batch_base + k) % 1023]
                 code_sr <= {code_orig[load_code_idx], code_sr[SR_LEN-1:1]};
                 load_code_idx <= (load_code_idx == CODE_LEN - 1)
                                    ? 10'd0 : load_code_idx + 10'd1;
@@ -231,44 +277,114 @@ module gps_acq_engine #(
                 sample_cnt <= sample_cnt + 13'd1;
                 if (sample_cnt == EPOCH_SAMPLES) begin
                     peak_idx   <= 5'd0;
+                    peak_pipe  <= 2'd0;
                     corr_valid <= 1'b0;
-                    state      <= S_PEAK;
+                    // Issue first power RAM read for accumulation
+                    pwr_raddr  <= batch_base;
+                    state      <= S_PEAK_ACC;
                 end
             end
 
             // ---------------------------------------------------
-            S_PEAK: begin
-                // Scan LANES accumulators, update best if stronger
-                begin : peak_check
-                    reg signed [23:0] pi, pq;
-                    reg [23:0] ai, aq;
-                    reg [24:0] mag;
-                    reg [9:0]  ph;
-                    pi = acc_i[peak_idx];
-                    pq = acc_q[peak_idx];
-                    ai = pi[23] ? (~pi + 24'd1) : pi;
-                    aq = pq[23] ? (~pq + 24'd1) : pq;
-                    mag = {1'b0, ai} + {1'b0, aq};
-                    ph = batch_base + {5'd0, peak_idx};
+            // Compute |I|+|Q| per lane, add to power RAM (read-modify-write)
+            S_PEAK_ACC: begin
+                // 3-stage pipeline:
+                //   pipe=0: issue pwr_ram read for lane peak_idx (done in previous cycle or entry)
+                //   pipe=1: read arrives in pwr_rdata; compute magnitude
+                //   pipe=2: write back accumulated value
+                case (peak_pipe)
+                2'd0: begin
+                    // Read already issued; advance pipeline
+                    peak_pipe <= 2'd1;
+                end
+                2'd1: begin
+                    // pwr_rdata now has the old accumulated power
+                    // Compute |I|+|Q| for current lane
+                    begin : acc_block
+                        reg signed [23:0] pi, pq;
+                        reg [23:0] ai, aq;
+                        reg [24:0] mag;
+                        reg [9:0]  ph;
+                        pi = acc_i[peak_idx];
+                        pq = acc_q[peak_idx];
+                        ai = pi[23] ? (~pi + 24'd1) : pi;
+                        aq = pq[23] ? (~pq + 24'd1) : pq;
+                        mag = {1'b0, ai} + {1'b0, aq};
+                        ph = batch_base + {5'd0, peak_idx};
 
-                    if (ph < CODE_LEN && {7'd0, mag} > best_power) begin
-                        best_power <= {7'd0, mag};
-                        best_phase <= ph;
+                        if (ph < CODE_LEN) begin
+                            pwr_we    <= 1'b1;
+                            pwr_waddr <= ph;
+                            pwr_wdata <= pwr_rdata + {7'd0, mag};
+                        end
+                    end
+                    peak_pipe <= 2'd2;
+                end
+                2'd2: begin
+                    // Write done; advance to next lane or next batch
+                    if (peak_idx == LANES - 1) begin
+                        if (batch_idx == NUM_BATCHES - 1) begin
+                            // All batches done for this epoch
+                            state <= S_NEXT_EPOCH;
+                        end else begin
+                            batch_idx  <= batch_idx + 6'd1;
+                            batch_base <= batch_base + LANES[9:0];
+                            load_ptr   <= 11'd0;
+                            state      <= S_LOAD_SR;
+                        end
+                    end else begin
+                        peak_idx  <= peak_idx + 5'd1;
+                        // Issue next read
+                        pwr_raddr <= batch_base + {5'd0, peak_idx + 5'd1};
+                        peak_pipe <= 2'd0;
                     end
                 end
+                default: peak_pipe <= 2'd0;
+                endcase
+            end
 
-                peak_idx <= peak_idx + 5'd1;
-                if (peak_idx == LANES - 1) begin
-                    if (batch_idx == NUM_BATCHES - 1) begin
+            // ---------------------------------------------------
+            S_NEXT_EPOCH: begin
+                epoch_cnt <= epoch_cnt + 6'd1;
+                if (epoch_cnt + 6'd1 == num_epochs) begin
+                    // All epochs done, scan for best
+                    scan_addr  <= 10'd0;
+                    scan_pipe  <= 2'd0;
+                    best_phase <= 10'd0;
+                    best_power <= 32'd0;
+                    pwr_raddr  <= 10'd0;
+                    state      <= S_FIND_BEST;
+                end else begin
+                    // Another epoch: re-capture, carrier phase continues
+                    buf_waddr <= 12'd0;
+                    state     <= S_CAPTURE;
+                end
+            end
+
+            // ---------------------------------------------------
+            // Scan power RAM for the best code phase
+            S_FIND_BEST: begin
+                case (scan_pipe)
+                2'd0: begin
+                    // Read issued in previous cycle
+                    scan_pipe <= 2'd1;
+                end
+                2'd1: begin
+                    // pwr_rdata has the value for scan_addr
+                    if (pwr_rdata > best_power) begin
+                        best_power <= pwr_rdata;
+                        best_phase <= scan_addr;
+                    end
+                    if (scan_addr == CODE_LEN - 1) begin
                         state <= S_DONE;
                     end else begin
-                        batch_idx  <= batch_idx + 6'd1;
-                        batch_base <= batch_base + LANES[9:0];
-                        load_ptr   <= 11'd0;
-                        // load_code_idx continues wrapping from previous batch
-                        state <= S_LOAD_SR;
+                        scan_addr <= scan_addr + 10'd1;
+                        pwr_raddr <= scan_addr + 10'd1;
+                        scan_pipe <= 2'd0;
                     end
                 end
+                default: scan_pipe <= 2'd0;
+                endcase
             end
 
             // ---------------------------------------------------

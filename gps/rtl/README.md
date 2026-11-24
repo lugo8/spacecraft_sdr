@@ -5,21 +5,27 @@ Verilog RTL for the GPS L1 C/A correlator, targeting the Lattice ECP5 on the Lim
 ## Module hierarchy
 
 ```
-gps_correlator          Top-level: 12-channel correlator + acquisition + tracking loop
-├── gps_channel ×12     Per-channel E/P/L accumulate-and-dump with carrier/code NCOs
+gps_correlator          Top-level: 8-channel correlator + acquisition + tracking loop
+├── gps_channel ×8      Per-channel E/P/L accumulate-and-dump with carrier/code NCOs
 │   └── gps_ca_gen      Gold code generator (G1/G2 LFSRs, all 32 PRN tap selections)
-└── gps_acq_engine      Matched-filter acquisition (20 parallel correlation lanes)
-    └── gps_ca_gen      Code generator instance for acquisition
+└── gps_fft_acq         FFT-based acquisition (4096-pt pipelined FFT, all code phases)
+    ├── gps_ca_gen      Code generator instance for acquisition
+    └── fftmain         4-bit 4096-point pipelined FFT (dblclockfft, in fft/ subdir)
+        ├── fftstage ×10   Butterfly stages with twiddle ROMs
+        ├── qtrstage       Quarter-stage (N=4)
+        └── laststage      Final radix-2 stage (N=2)
 ```
 
 ## Files
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `gps_correlator.v` | ~450 | Top-level. Register map, 12 channel instances, matched-filter acquisition engine, normalized-discriminator tracking loop filter with sequential divider. Version 5 (`0x47505305`). |
+| `gps_correlator.v` | ~600 | Top-level. Register map, 8 channel instances, FFT acquisition engine, FLL/PLL/DLL tracking loop with sequential divider, carrier-aiding. Version 7 (`0x47505307`). |
 | `gps_channel.v` | ~150 | Single correlator channel. Carrier wipe-off (CORDIC-free, sign/negate), code NCO, early/prompt/late code mixing, accumulate-and-dump with output registers. |
 | `gps_ca_gen.v` | ~100 | C/A Gold code generator. Two 10-bit LFSRs (G1, G2), 32 PRN tap selections via parameter. Generates ±1 code chips at the code NCO rate. |
-| `gps_acq_engine.v` | ~280 | Matched-filter acquisition. Captures one epoch (4096 samples) into block RAM after carrier wipe-off, then correlates all 1023 code phases using a 1042-bit shift register with 20 parallel output taps. Reports best code phase and magnitude. |
+| `gps_fft_acq.v` | ~330 | FFT-based acquisition. 3 FFT passes per epoch: forward FFT of signal, forward FFT of code with complex multiply, inverse FFT (conjugate trick) with magnitude accumulation. All 4096 code phases tested simultaneously. ~26 ms per 20-epoch trial vs ~1.3 s for time-domain. |
+| `gps_acq_engine.v` | ~400 | (Legacy) Time-domain matched-filter acquisition with parallel lanes. Retained for reference; not instantiated in v7. |
+| `fft/*.v, fft/*.hex` | — | 4-bit 4096-point pipelined FFT from [dblclockfft](https://github.com/ZipCPU/dblclockfft). Generated with `fftgen -f 4096 -n 4 -p 24 -s`. |
 | `gps_spi_slave.v` | — | SPI slave interface (phase 2, flight computer access — not yet integrated). |
 | `gps_top.v` | — | Standalone top-level wrapper (for simulation/testing outside LiteX). |
 
@@ -55,7 +61,7 @@ gps_correlator          Top-level: 12-channel correlator + acquisition + trackin
 |-----|-----|------|-------------|
 | 0 | RW | GLOB_CTRL | `{31'b0, enable}` |
 | 1 | R | EPOCH_CNT | Global epoch counter |
-| 2 | R | VERSION | `0x47505305` ("GPS" + v5) |
+| 2 | R | VERSION | `0x47505307` ("GPS" + v7) |
 | 3 | W | ACQ_CTRL | bit 0: start, bit 1: abort |
 | 3 | R | ACQ_STATUS | `{done, active, 20'b0, best_phase[9:0]}` |
 | 4 | RW | ACQ_CFG | `{11'b0, prn[4:0], 16'b0}` |
