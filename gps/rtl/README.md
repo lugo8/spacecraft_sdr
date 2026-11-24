@@ -18,16 +18,16 @@ gps_correlator          Top-level: 8-channel correlator + acquisition + tracking
 
 ## Files
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `gps_correlator.v` | ~600 | Top-level. Register map, 8 channel instances, FFT acquisition engine, FLL/PLL/DLL tracking loop with sequential divider, carrier-aiding. Version 7 (`0x47505307`). |
-| `gps_channel.v` | ~150 | Single correlator channel. Carrier wipe-off (CORDIC-free, sign/negate), code NCO, early/prompt/late code mixing, accumulate-and-dump with output registers. |
-| `gps_ca_gen.v` | ~100 | C/A Gold code generator. Two 10-bit LFSRs (G1, G2), 32 PRN tap selections via parameter. Generates ±1 code chips at the code NCO rate. |
-| `gps_fft_acq.v` | ~330 | FFT-based acquisition. 3 FFT passes per epoch: forward FFT of signal, forward FFT of code with complex multiply, inverse FFT (conjugate trick) with magnitude accumulation. All 4096 code phases tested simultaneously. ~26 ms per 20-epoch trial vs ~1.3 s for time-domain. |
-| `gps_acq_engine.v` | ~400 | (Legacy) Time-domain matched-filter acquisition with parallel lanes. Retained for reference; not instantiated in v7. |
-| `fft/*.v, fft/*.hex` | — | 4-bit 4096-point pipelined FFT from [dblclockfft](https://github.com/ZipCPU/dblclockfft). Generated with `fftgen -f 4096 -n 4 -p 24 -s`. |
-| `gps_spi_slave.v` | — | SPI slave interface (phase 2, flight computer access — not yet integrated). |
-| `gps_top.v` | — | Standalone top-level wrapper (for simulation/testing outside LiteX). |
+| File | Description |
+|------|-------------|
+| `gps_correlator.v` | Top-level. Register map, 8 channel instances, FFT acquisition engine, FLL/PLL/DLL tracking loop with sequential divider, carrier-aiding. Version 7 (`0x47505307`). |
+| `gps_channel.v` | Single correlator channel. Carrier wipe-off (sign/negate), code NCO, early/prompt/late code mixing, accumulate-and-dump with output registers. |
+| `gps_ca_gen.v` | C/A Gold code generator. Two 10-bit LFSRs (G1, G2), 32 PRN tap selections via parameter. |
+| `gps_fft_acq.v` | FFT-based acquisition. 3 FFT passes per epoch: forward FFT of signal, forward FFT of code with complex multiply, inverse FFT (conjugate trick) with magnitude accumulation. All 4096 code phases tested simultaneously. |
+| `gps_acq_engine.v` | (Legacy) Time-domain matched-filter acquisition with parallel lanes. Not instantiated in v7. |
+| `fft/*.v, fft/*.hex` | 4-bit 4096-point pipelined FFT from [dblclockfft](https://github.com/ZipCPU/dblclockfft). Generated with `fftgen -f 4096 -n 4 -p 24 -s`. |
+| `gps_spi_slave.v` | SPI slave interface (phase 2, flight computer access — not yet integrated). |
+| `gps_top.v` | Standalone top-level wrapper (for simulation/testing outside LiteX). |
 
 ## Register map
 
@@ -54,6 +54,13 @@ gps_correlator          Top-level: 8-channel correlator + acquisition + tracking
 | 0 | RW | CAR_GAIN_P | Carrier PLL proportional gain (signed 32-bit) |
 | 1 | RW | CAR_GAIN_I | Carrier PLL integral gain (signed 32-bit) |
 | 2 | RW | COD_GAIN | Code DLL gain (signed 32-bit) |
+| 3 | RW | FLL_GAIN | FLL frequency gain (signed 32-bit) |
+
+### Channel 13 — FLL config
+
+| Reg | R/W | Name | Description |
+|-----|-----|------|-------------|
+| 0 | RW | FLL_EPOCHS | Number of epochs in FLL mode before switching to PLL (default 400) |
 
 ### Channel 15 — global / acquisition
 
@@ -64,21 +71,34 @@ gps_correlator          Top-level: 8-channel correlator + acquisition + tracking
 | 2 | R | VERSION | `0x47505307` ("GPS" + v7) |
 | 3 | W | ACQ_CTRL | bit 0: start, bit 1: abort |
 | 3 | R | ACQ_STATUS | `{done, active, 20'b0, best_phase[9:0]}` |
-| 4 | RW | ACQ_CFG | `{11'b0, prn[4:0], 16'b0}` |
+| 4 | RW | ACQ_CFG | `{5'b0, prn[4:0], 10'b0, num_epochs[5:0]}` |
 | 5 | RW | ACQ_CARRIER | Carrier NCO freq word for acquisition |
-| 6 | R | ACQ_POWER | Best |IP|+|QP| magnitude |
+| 6 | R | ACQ_POWER | Best |IP|+|QP| magnitude (accumulated over num_epochs) |
 
 ## Tracking loop filter
 
 Runs entirely on-FPGA at the 1 kHz epoch rate (no USB in the loop).
 
-**Discriminators** (normalized, amplitude-independent):
-- PLL: `QP × sign(IP) / |IP|` — approximates atan(phase_error) near lock
-- DLL: `(|IE|+|QE| - |IL|-|QL|) / (|IE|+|QE| + |IL|+|QL|)` — bounded [-1, 1]
+**FLL** (first `FLL_EPOCHS` after tracking enable, cross/dot discriminator):
+- `cross = prev_IP × QP - prev_QP × IP`
+- `dot = prev_IP × IP + prev_QP × QP`
+- `freq_err = cross × sign(dot)`
+- `carrier_freq += (freq_err × FLL_GAIN) >> 16`
+
+**PLL** (after FLL, normalized Costas):
+- `norm_phase = (QP × sign(IP)) / |IP|`
+- `carrier_freq += (norm_phase × CAR_GAIN_P + integral × CAR_GAIN_I) >> 16`
+
+**DLL** (normalized early-minus-late):
+- `norm_code = (|IE|+|QE| - |IL|-|QL|) / (|IE|+|QE| + |IL|+|QL|)`
+- `code_freq -= (norm_code × COD_GAIN) >> 16`
+
+**Carrier-aiding**: `code_freq = CODE_FREQ_NOM + (carrier_freq - car_f_base) / 1540`
+(approximated as >>10, 0.26% error).
 
 **Normalization**: 20-cycle sequential restoring divider, Q4.16 fixed-point output.
 
-**Pipeline** (46 sub-cycles per channel, 552 cycles per full 12-channel scan):
+**Pipeline** (52 sub-cycles per channel, 624 cycles per full 12-channel scan):
 
 | Sub-cycle | Action |
 |-----------|--------|
@@ -86,15 +106,21 @@ Runs entirely on-FPGA at the 1 kHz epoch rate (no USB in the loop).
 | 1–20 | PLL division (20 iterations) |
 | 21 | Latch PLL result, setup DLL division |
 | 22–41 | DLL division (20 iterations) |
-| 42 | Latch DLL result, start carrier-P multiply |
-| 43 | Save car_P, start carrier-I multiply |
-| 44 | Save car_I, start code multiply |
-| 45 | Writeback NCO updates, advance channel |
+| 42 | Latch DLL result, start FLL cross multiply (prev_IP × QP) |
+| 43 | Latch cross1, start prev_QP × IP |
+| 44 | Compute cross, start FLL dot multiply (prev_IP × IP) |
+| 45 | Latch dot1, start prev_QP × QP |
+| 46 | Compute dot, start carrier gain multiply (FLL or PLL) |
+| 47 | Save carrier term, start integral multiply (PLL) |
+| 48 | Save integral term, start code DLL multiply |
+| 49 | Code term ready |
+| 50 | (available) |
+| 51 | Writeback NCO updates, advance channel |
 
 **Resource usage** (estimated):
-- 552 / 4096 = 13.5% of epoch budget
+- 624 / 4096 = 15% of epoch budget
 - 4 DSP slices (shared 32×32 multiplier)
-- 12 × 32-bit integrator registers
+- 12 × 32-bit integrator + prev_ip/prev_qp/fll_count/car_f_base registers
 - Divider: ~100 LUTs (combinational compare + subtract)
 
 ## Clock domain
