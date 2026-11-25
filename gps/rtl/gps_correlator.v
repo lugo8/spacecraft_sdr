@@ -126,6 +126,7 @@ module gps_correlator (
     wire       acq_done, acq_active;
     wire [9:0] acq_best_phase;
     wire [31:0] acq_best_power;
+    wire [31:0] acq_debug;
 
     gps_fft_acq acq_eng (
         .clk          (clk),
@@ -141,7 +142,8 @@ module gps_correlator (
         .done         (acq_done),
         .active       (acq_active),
         .best_phase   (acq_best_phase),
-        .best_power   (acq_best_power)
+        .best_power   (acq_best_power),
+        .debug        (acq_debug)
     );
 
     // ---- Tracking loop filter ----
@@ -591,7 +593,7 @@ module gps_correlator (
                 3'd4: reg_rdata = {5'd0, acq_prn, 10'd0, acq_num_epochs};
                 3'd5: reg_rdata = acq_carrier;
                 3'd6: reg_rdata = acq_best_power;
-                3'd7: reg_rdata = 32'd0;
+                3'd7: reg_rdata = acq_debug;
                 default: ;
             endcase
         end

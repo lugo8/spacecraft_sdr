@@ -39,7 +39,8 @@ module gps_fft_acq (
     output wire        done,
     output wire        active,
     output reg  [9:0]  best_phase,
-    output reg  [31:0] best_power
+    output reg  [31:0] best_power,
+    output wire [31:0] debug
 );
 
     localparam N         = 4096;
@@ -65,6 +66,7 @@ module gps_fft_acq (
     reg [3:0] state;
     assign done   = (state == S_DONE);
     assign active = (state != S_IDLE) && (state != S_DONE);
+    assign debug  = {2'd0, state, fft_sync, out_sync_seen, out_active, epoch_cnt, cnt};
 
     // ---- Carrier NCO ----
     reg [31:0] car_phase;
