@@ -359,13 +359,13 @@ typedef struct {
 static int acquire_prn(int prn, int32_t doppler_nco, int num_epochs,
                        acq_result_t *result)
 {
-    /* Configure acquisition engine */
+    /* Abort any stuck acquisition, then configure and start */
+    gps_write(CH_GLOBAL, REG_ACQ_CTRL, 2);  /* abort */
+    usleep(1000);
     gps_write(CH_GLOBAL, REG_ACQ_CFG,
               ((uint32_t)prn << 16) | (num_epochs & 0x3F));
     gps_write(CH_GLOBAL, REG_ACQ_CAR, (uint32_t)doppler_nco);
-
-    /* Start */
-    gps_write(CH_GLOBAL, REG_ACQ_CTRL, 1);
+    gps_write(CH_GLOBAL, REG_ACQ_CTRL, 1);  /* start */
 
     /* Poll for completion */
     for (int i = 0; i < 200; i++) {
