@@ -233,6 +233,15 @@ module gps_fft_acq (
             best_power    <= 32'd0;
             pipe_cr       <= 0;
             pipe_ci       <= 0;
+            sig_ra        <= 0;
+            sig_wa        <= 0;
+            pwr_ra        <= 0;
+            pwr_wa        <= 0;
+            scan_addr     <= 0;
+            scan_pipe     <= 2'd0;
+            pipe_mul_addr <= 0;
+            pipe_acc_addr <= 0;
+            pipe_mag      <= 0;
         end else if (abort && state != S_IDLE) begin
             state <= S_IDLE;
         end else begin
@@ -244,7 +253,7 @@ module gps_fft_acq (
                     out_active    <= 1'b1;
                     out_cnt       <= 0;
                 end else if (out_active) begin
-                    if (out_cnt == N[LGN-1:0] - 1)
+                    if (out_cnt == N - 1)
                         out_active <= 1'b0;
                     else
                         out_cnt <= out_cnt + 1;
@@ -281,7 +290,7 @@ module gps_fft_acq (
                 pwr_wa <= cnt[LGN-1:0];
                 pwr_wd <= 16'd0;
                 cnt    <= cnt + 1;
-                if (cnt[LGN-1:0] == N[LGN-1:0] - 1) begin
+                if (cnt[LGN-1:0] == N - 1) begin
                     car_phase <= 32'd0;
                     cnt       <= 0;
                     state     <= S_CAPTURE;
@@ -297,7 +306,7 @@ module gps_fft_acq (
                                {(BW-IWIDTH){q_trunc[IWIDTH-1]}}, q_trunc};
                     car_phase <= car_phase + carrier_freq;
                     cnt <= cnt + 1;
-                    if (cnt[LGN-1:0] == N[LGN-1:0] - 1) begin
+                    if (cnt[LGN-1:0] == N - 1) begin
                         cnt           <= 0;
                         fft_rst_r     <= 1'b1;
                         out_sync_seen <= 1'b0;
@@ -327,7 +336,7 @@ module gps_fft_acq (
                     sig_wd <= {fft_or[OWIDTH-1:OWIDTH-BW], fft_oi[OWIDTH-1:OWIDTH-BW]};
                 end
 
-                if (out_active && out_cnt == N[LGN-1:0] - 1) begin
+                if (out_active && out_cnt == N - 1) begin
                     cnt           <= 0;
                     fft_rst_r     <= 1'b1;
                     out_sync_seen <= 1'b0;
@@ -361,7 +370,7 @@ module gps_fft_acq (
                     pipe_mul_valid <= 1'b1;
 
                 if (!out_active && out_sync_seen && !pipe_mul_valid
-                    && pipe_mul_addr == N[LGN-1:0] - 1) begin
+                    && pipe_mul_addr == N - 1) begin
                     pipe_mul_valid <= 1'b1;
                     cnt            <= 0;
                     fft_rst_r      <= 1'b1;
@@ -396,7 +405,7 @@ module gps_fft_acq (
                     pipe_acc_valid <= 1'b1;
 
                 if (!out_active && out_sync_seen && !pipe_acc_valid
-                    && pipe_acc_addr == bitrev(N[LGN-1:0] - 1)) begin
+                    && pipe_acc_addr == bitrev(N - 1)) begin
                     pipe_acc_valid <= 1'b1;
                     state          <= S_NEXT_EPOCH;
                 end
@@ -427,7 +436,7 @@ module gps_fft_acq (
                         best_power <= {16'd0, pwr_rd};
                         best_phase <= scan_addr[LGN-1:2];
                     end
-                    if (scan_addr == N[LGN-1:0] - 1) begin
+                    if (scan_addr == N - 1) begin
                         state <= S_DONE;
                     end else begin
                         scan_addr <= scan_addr + 1;

@@ -60,13 +60,11 @@ module gps_ca_gen (
         endcase
     end
 
-    assign code_out = g1[10] ^ g2_sel;
-    assign epoch = chip_en & (chip_cnt == 10'd1022) & ~seeking;
-
-    // Phase preset: reset LFSRs then advance chip-by-chip to target phase.
-    // Takes up to 1023 clocks (~25 us at 40 MHz).
     reg        seeking;
     reg [9:0]  seek_target;
+
+    assign code_out = g1[10] ^ g2_sel;
+    assign epoch = chip_en & (chip_cnt == 10'd1022) & ~seeking;
     assign busy = seeking;
 
     always @(posedge clk) begin
