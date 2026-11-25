@@ -267,6 +267,7 @@ static void gps_write(int ch, int reg, uint32_t value)
     csr_write(CSR_GPS_WDATA, value);
     csr_write(CSR_GPS_WEN, 1);
     usleep(200);  /* CDC settling */
+    csr_write(CSR_GPS_WEN, 0);
 }
 
 static uint32_t gps_read(int ch, int reg)
