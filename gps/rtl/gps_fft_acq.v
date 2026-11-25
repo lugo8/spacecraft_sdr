@@ -449,7 +449,13 @@ module gps_fft_acq (
             end
 
             // ============================================================
-            S_DONE: ;
+            S_DONE: begin
+                if (start) begin
+                    gen_ptr   <= 10'd0;
+                    epoch_cnt <= 6'd0;
+                    state     <= S_GEN_CODE;
+                end
+            end
 
             endcase
         end
