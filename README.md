@@ -29,10 +29,10 @@ argus2_docs/          Argus-2 cubesat comms subsystem documentation (PDFs)
 ## Quick start
 
 ```bash
-# 1. Build gateware on the Pi
+# 1. Build gateware on the Pi (uses pinned venv — do NOT use system Python)
 cd ~/LimeSDR_GW
 source .venv/bin/activate
-python3 boards/targets/limesdr_mini_v2.py --build --with-gps
+PYTHONPATH=. python3 boards/targets/limesdr_mini_v2.py --build --with-gps --no-ppsdo
 
 # 2. Flash bitstream
 # (use LimeSuite or openFPGALoader)
@@ -41,8 +41,8 @@ python3 boards/targets/limesdr_mini_v2.py --build --with-gps
 
 # 4. Run host controller
 cd ~/spacecraft_sdr/gps
-gcc -O2 -o gps_fpga gps_fpga.c -lm
-./gps_fpga --csr-csv ~/LimeSDR_GW/build/csr.csv
+g++ -O2 -o gps_fpga gps_fpga.cpp -llimesuiteng -lm -lpthread
+./gps_fpga
 ```
 
 ## Software-only receiver

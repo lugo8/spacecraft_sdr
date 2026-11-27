@@ -80,8 +80,8 @@ module gps_fft_acq (
     wire signed [12:0] i_sin = sin_neg ? -i_ext : i_ext;
     wire signed [13:0] i_mix = i_cos + q_sin;
     wire signed [13:0] q_mix = q_cos - i_sin;
-    wire signed [IWIDTH-1:0] i_trunc = i_mix[13:10];
-    wire signed [IWIDTH-1:0] q_trunc = q_mix[13:10];
+    wire signed [IWIDTH-1:0] i_trunc = i_mix[9:6];
+    wire signed [IWIDTH-1:0] q_trunc = q_mix[9:6];
 
     // ---- C/A code generator ----
     wire ca_rst = rst | (state == S_IDLE);
